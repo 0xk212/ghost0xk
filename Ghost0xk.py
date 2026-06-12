@@ -5336,7 +5336,7 @@ def run_banner():
     clear()
     selected = random.choice(BANNER_IMAGES)
     print(f"\n{R}{selected}{RS}")
-    print(f"\n{C}sbsecrybt youtube {R}https://www.youtube.com/@0xk-j7z{RS}\n")
+    print(f"\n{C}youtube {R}https://www.youtube.com/@0xk-j7z{RS}\n")
 
 def showMenu():
     options = [
