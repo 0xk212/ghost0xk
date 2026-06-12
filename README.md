@@ -89,7 +89,7 @@
 ```bash
 # Clone the repository
 git clone https://github.com/0xk212/ghost0xk.git
-cd Ghost0xK
+cd ghost0xk
 
 # Install core dependencies
 pip install requests beautifulsoup4 phonenumbers Pillow dnspython
